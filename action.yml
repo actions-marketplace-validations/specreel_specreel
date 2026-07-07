@@ -1,0 +1,99 @@
+name: "Specreel"
+description: "Turn the Playwright traces your tests produce into a watchable demo gallery — and optionally publish it."
+branding:
+  icon: "film"
+  color: "green"
+
+inputs:
+  traces:
+    description: "Directory of Playwright trace.zip files."
+    default: "test-results"
+  out:
+    description: "Output directory for the generated gallery."
+    default: "_site"
+  bundle:
+    description: "Also emit a single self-contained gallery.html ('true'/'false')."
+    default: "false"
+  theme:
+    description: "Color theme: dark | light."
+    default: "dark"
+  ai:
+    description: "Opt-in AI narration ('true'/'false'; needs anthropic-api-key)."
+    default: "false"
+  url:
+    description: "Public gallery URL to include in links/notifications."
+    default: ""
+  notify:
+    description: "Slack incoming-webhook URL to post a build summary to."
+    default: ""
+  anthropic-api-key:
+    description: "Anthropic API key for AI narration (BYO-key)."
+    default: ""
+  publish:
+    description: "Where to publish after building: none | ghpages | cloud."
+    default: "none"
+  cloud-url:
+    description: "Specreel Cloud base URL (when publish: cloud)."
+    default: ""
+  token:
+    description: "Specreel Cloud API token (when publish: cloud)."
+    default: ""
+  project:
+    description: "Cloud project slug (when publish: cloud)."
+    default: ""
+  python-version:
+    description: "Python version to set up."
+    default: "3.12"
+
+outputs:
+  gallery:
+    description: "Path to the generated gallery directory."
+    value: ${{ inputs.out }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Build the demo gallery
+      shell: bash
+      env:
+        # pass inputs via env (not inline ${{ }}) to avoid shell injection
+        SPECREEL: ${{ github.action_path }}/specreel.py
+        IN_TRACES: ${{ inputs.traces }}
+        IN_OUT: ${{ inputs.out }}
+        IN_BUNDLE: ${{ inputs.bundle }}
+        IN_THEME: ${{ inputs.theme }}
+        IN_AI: ${{ inputs.ai }}
+        IN_URL: ${{ inputs.url }}
+        IN_NOTIFY: ${{ inputs.notify }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: |
+        set -euo pipefail
+        FLAGS=( "$IN_TRACES" -o "$IN_OUT" --theme "$IN_THEME" )
+        [ "$IN_BUNDLE" = "true" ] && FLAGS+=( --bundle )
+        [ "$IN_AI" = "true" ] && FLAGS+=( --ai )
+        [ -n "$IN_URL" ] && FLAGS+=( --url "$IN_URL" )
+        [ -n "$IN_NOTIFY" ] && FLAGS+=( --notify "$IN_NOTIFY" )
+        python "$SPECREEL" "${FLAGS[@]}"
+
+    - name: Publish the gallery
+      if: ${{ inputs.publish != 'none' }}
+      shell: bash
+      env:
+        SPECREEL: ${{ github.action_path }}/specreel.py
+        IN_OUT: ${{ inputs.out }}
+        IN_PUBLISH: ${{ inputs.publish }}
+        IN_CLOUD_URL: ${{ inputs.cloud-url }}
+        IN_TOKEN: ${{ inputs.token }}
+        IN_PROJECT: ${{ inputs.project }}
+      run: |
+        set -euo pipefail
+        if [ "$IN_PUBLISH" = "cloud" ]; then
+          python "$SPECREEL" publish "$IN_OUT" --to cloud \
+            --cloud-url "$IN_CLOUD_URL" --token "$IN_TOKEN" --project "$IN_PROJECT"
+        elif [ "$IN_PUBLISH" = "ghpages" ]; then
+          python "$SPECREEL" publish "$IN_OUT" --to ghpages
+        fi
