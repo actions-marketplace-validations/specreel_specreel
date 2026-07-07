@@ -1,0 +1,21 @@
+# The sdist must ship ONLY the open-source CLI. Without this, setuptools'
+# defaults sweep the whole tree — including the proprietary cloud/ backend —
+# into the source tarball (the wheel's py-modules setting protects the wheel
+# only, NOT the sdist).
+include LICENSE
+include README.md
+include specreel.py
+include specreel_mcp.py
+prune cloud
+prune www
+prune scripts
+prune docs
+prune docs-site
+prune examples
+prune integrations
+prune tests
+prune mcpb
+prune .github
+prune .claude
+global-exclude .env *.pyc
+global-exclude env.deploy.yaml
