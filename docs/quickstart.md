@@ -93,7 +93,7 @@ python specreel.py publish site/ --to ghpages    # or GitHub Pages
 **5. Automate it** so demos regenerate on every green build — the one-step
 [GitHub Action](github-action.md):
 ```yaml
-- uses: your-org/specreel@v1
+- uses: specreel/specreel@v1
   with: { traces: test-results, publish: cloud,
           cloud-url: ${{ secrets.SPECREEL_CLOUD_URL }},
           token: ${{ secrets.SPECREEL_CLOUD_TOKEN }}, project: my-app }

@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npx playwright install --with-deps chromium && npx playwright test || true
-      - uses: your-org/specreel@v1            # the reusable action
+      - uses: specreel/specreel@v1            # the reusable action
         with:
           traces: test-results
           bundle: "true"

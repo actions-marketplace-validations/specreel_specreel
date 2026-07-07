@@ -29,8 +29,8 @@ all = ["Pillow>=9", "mcp>=1.2", "Flask>=3.0", "gunicorn>=21.2", "psycopg[binary]
 [project.urls]
 Homepage = "https://specreel.dev"
 Documentation = "https://app.specreel.dev/docs"
-Source = "https://github.com/dylanroy/specreel"
-Issues = "https://github.com/dylanroy/specreel/issues"
+Source = "https://github.com/specreel/specreel"
+Issues = "https://github.com/specreel/specreel/issues"
 
 [project.scripts]
 specreel = "specreel:main"

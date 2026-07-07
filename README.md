@@ -1,5 +1,10 @@
 # specreel
 
+[![CI](https://github.com/specreel/specreel/actions/workflows/tests.yml/badge.svg)](https://github.com/specreel/specreel/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/specreel)](https://pypi.org/project/specreel/)
+[![Python](https://img.shields.io/pypi/pyversions/specreel)](https://pypi.org/project/specreel/)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+
 **Turn the Playwright `trace.zip` your tests already produce into a watchable,
 shareable demo — and regenerate it on every green build, so the demo can't go
 stale.** When it would, a test fails instead.
