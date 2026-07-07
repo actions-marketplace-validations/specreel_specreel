@@ -1,0 +1,143 @@
+# Specreel freshness loop — COPY THIS FILE into your repo's .github/workflows/.
+# (It lives in examples/ here so it doesn't run against the Specreel repo itself,
+# which has no JS test suite. Or use the one-step composite action — see
+# docs/github-action.md.)
+#
+# On every green build, turn the Playwright traces your tests already produce
+# into a watchable demo gallery and publish it to GitHub Pages — so the demo
+# can never be older than the last passing build.
+#
+# Drop this into any repo that runs Playwright with tracing on. Two ways to use:
+#   A) Standalone (this file runs the tests itself) — the default below.
+#   B) Reuse an existing test job's artifacts — see the commented `download`
+#      step and delete the "Run Playwright tests" block.
+#
+# Requirements:
+#   - Playwright config has tracing enabled, e.g. JS:  use: { trace: 'on' }
+#     or Python:  --tracing on  (so test-results/**/trace.zip exists).
+#   - Pages enabled for the repo (Settings -> Pages -> Source: GitHub Actions).
+
+name: specreel
+
+on:
+  push:
+    branches: [main]
+  pull_request:            # PRs get a preview gallery + a sticky comment
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  pull-requests: write     # for the PR preview comment
+
+# one live demo site at a time; let an in-progress publish finish
+concurrency:
+  group: specreel-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --- Produce traces -----------------------------------------------------
+      # Option A: run the tests here. Replace with your real test command.
+      # `|| true` so a failing test still publishes a demo (cards show the
+      # failure in red) rather than skipping the whole site.
+      - name: Run Playwright tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test || true
+      # Option B (reuse another workflow's artifact) — delete the block above
+      # and uncomment:
+      # - uses: actions/download-artifact@v4
+      #   with: { name: playwright-traces, path: test-results }
+
+      # --- Generate the demo gallery -----------------------------------------
+      - name: Build demo gallery
+        run: |
+          python specreel.py test-results -o _site
+
+      - name: Fail the build if any flow failed
+        # The demo still publishes (next step), but a red flow should turn the
+        # build red too — the demo and the test are the same artifact.
+        run: |
+          if grep -q "test failed" _site/index.html; then
+            echo "::warning::One or more flows failed — see the published demo gallery."
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  # --- PR preview: build the gallery for the PR and post a sticky comment -------
+  preview:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Playwright tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test || true
+
+      - name: Build demo gallery (bundle)
+        run: python specreel.py test-results -o _site --bundle
+
+      - name: Upload gallery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: specreel-demo-gallery
+          path: _site
+
+      # Pull the currently-published manifest so the comment can show what changed.
+      - name: Fetch previously published manifest (for the diff)
+        run: |
+          OWNER="${GITHUB_REPOSITORY%%/*}"; NAME="${GITHUB_REPOSITORY#*/}"
+          curl -fsSL "https://${OWNER}.github.io/${NAME}/manifest.json" \
+            -o prev-manifest.json || echo '{}' > prev-manifest.json
+
+      - name: Post / update PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          SINCE=""
+          if python -c "import json,sys; sys.exit(0 if json.load(open('prev-manifest.json')).get('flows') else 1)" 2>/dev/null; then
+            SINCE="--since prev-manifest.json"
+          fi
+          BODY="$(python specreel.py summary _site $SINCE)"
+          BODY="${BODY}"$'\n\n'"_Download the \`specreel-demo-gallery\` artifact from this run to open \`gallery.html\` locally._"
+          # upsert a single sticky comment, matched by the marker in markdown_summary
+          ID=$(gh api "repos/$REPO/issues/$PR/comments" \
+                 --jq '.[] | select(.body | contains("specreel-summary")) | .id' | head -n1)
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$ID" -f body="$BODY" >/dev/null
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -f body="$BODY" >/dev/null
+          fi

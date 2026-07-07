@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specreel"
+version = "0.1.0"
+description = "Turn Playwright traces into watchable, shareable demo galleries — demos that are also your tests."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Dylan Roy" }]
+keywords = ["playwright", "demo", "e2e", "testing", "screenshots", "documentation"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Software Development :: Documentation",
+]
+dependencies = []   # the core is standard-library only
+
+[project.optional-dependencies]
+mp4 = ["Pillow>=9"]                  # only needed for --mp4 export
+mcp = ["mcp>=1.2"]                   # only needed to run the MCP server
+cloud = ["Flask>=3.0", "gunicorn>=21.2"]    # run Specreel Cloud (SQLite default)
+postgres = ["psycopg[binary]>=3.1"]         # + Postgres/Supabase backend
+all = ["Pillow>=9", "mcp>=1.2", "Flask>=3.0", "gunicorn>=21.2", "psycopg[binary]>=3.1"]
+
+[project.urls]
+Homepage = "https://specreel.dev"
+Documentation = "https://app.specreel.dev/docs"
+Source = "https://github.com/dylanroy/specreel"
+Issues = "https://github.com/dylanroy/specreel/issues"
+
+[project.scripts]
+specreel = "specreel:main"
+specreel-mcp = "specreel_mcp:main"   # only runnable with the [mcp] extra installed
+
+[tool.setuptools]
+# Open-core: the published package ships the OSS CLI only. The Cloud service
+# (cloud/) is intentionally NOT packaged here so an accidental `pip publish` can't
+# leak the proprietary backend — it runs from the repo / its own private repo +
+# Docker. The [cloud]/[postgres] extras still install its runtime deps.
+py-modules = ["specreel", "specreel_mcp"]
