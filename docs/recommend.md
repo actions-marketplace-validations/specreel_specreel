@@ -5,7 +5,7 @@ it, suggest demo-worthy flows, and scaffold a runnable Playwright script — so 
 go from "an app" to "a gallery" without writing the first flow by hand.
 
 ```bash
-python specreel.py recommend http://localhost:3000 --max 10
+specreel recommend http://localhost:3000 --max 10
 ```
 ```
   crawling http://localhost:3000 (max 10 pages) ...
@@ -16,7 +16,7 @@ python specreel.py recommend http://localhost:3000 --max 10
     4. [nav]    Open Pricing  (/pricing)
     5. [nav]    Open Features  (/features)
   scaffolded -> specreel_flows.py
-  edit the TODOs, then:  python specreel_flows.py && specreel.py test-results -o site --bundle
+  edit the TODOs, then:  python specreel_flows.py && specreel test-results -o site --bundle
 ```
 
 ## What it does
@@ -28,10 +28,10 @@ python specreel.py recommend http://localhost:3000 --max 10
 
 ## The full loop
 ```bash
-python specreel.py recommend http://localhost:3000   # 1. suggest + scaffold
+specreel recommend http://localhost:3000   # 1. suggest + scaffold
 # (edit the TODOs in specreel_flows.py — add assertions / clicks you care about)
 python specreel_flows.py                             # 2. run -> test-results/*/trace.zip
-python specreel.py test-results -o site --bundle     # 3. render the gallery
+specreel test-results -o site --bundle     # 3. render the gallery
 ```
 
 ## Options
@@ -46,7 +46,7 @@ By default `recommend` reads the **server HTML** (fast, zero-dep). For
 **client-rendered SPAs** (React/Vue/etc., where the initial HTML is near-empty),
 add `--browser` to render each page with Playwright first and read the live DOM:
 ```bash
-python specreel.py recommend http://localhost:5173 --browser
+specreel recommend http://localhost:5173 --browser
 ```
 Needs Playwright (`pip install playwright && playwright install chromium`) — the
 same thing you need to run the scaffold. If a static crawl finds nothing, the CLI
@@ -57,8 +57,8 @@ Public pages crawl out of the box. For pages behind a login, pass your session a
 cookie (or any header) — it's sent with every request, in both static and
 `--browser` mode:
 ```bash
-python specreel.py recommend http://localhost:3000 --cookie "session=abc; csrf=xyz"
-python specreel.py recommend http://localhost:3000 --header "Authorization: Bearer <token>"
+specreel recommend http://localhost:3000 --cookie "session=abc; csrf=xyz"
+specreel recommend http://localhost:3000 --header "Authorization: Bearer <token>"
 ```
 Grab the cookie from your browser's devtools (Application → Cookies) after logging in.
 

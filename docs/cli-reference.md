@@ -2,7 +2,7 @@
 
 Specreel has one default command (render a trace or a directory) plus a few verbs.
 
-## Render — `specreel.py <trace|dir> [options]`
+## Render — `specreel <trace|dir> [options]`
 - `<trace>` — a `trace.zip` (single demo) **or** a directory to scan (gallery/batch).
 - `-o, --out PATH` — output directory (default `specreel-out`).
 - `--title TITLE` — demo title (single-trace mode).
@@ -28,8 +28,8 @@ Specreel has one default command (render a trace or a directory) plus a few verb
 > no key and no audio files.
 
 ```bash
-python specreel.py trace.zip -o out/ --title "Checkout"
-python specreel.py test-results/ -o site/ --bundle --ai --theme light
+specreel trace.zip -o out/ --title "Checkout"
+specreel test-results/ -o site/ --bundle --ai --theme light
 ```
 
 ### Secrets in captions
@@ -56,7 +56,7 @@ script. See [recommend](recommend.md).
   no file written). Used by Specreel Cloud's onboarding wizard.
 
 ```bash
-python specreel.py recommend http://localhost:3000 --max 10
+specreel recommend http://localhost:3000 --max 10
 ```
 
 ## `scaffold --specs <json>` — assemble a script from a wizard spec
@@ -80,7 +80,7 @@ does `specreel.yml` parse? Exits non-zero if something's fatal — handy as a CI
 - `--mp4` — also check MP4 export readiness (Pillow + ffmpeg).
 
 ```bash
-python specreel.py doctor test-results
+specreel doctor test-results
 #   ✓ signup/trace.zip: 5 steps · 12 frames
 #   ⚠ checkout/trace.zip: 4 steps but 0 screencast frames — enable screenshots in tracing
 #   ready (with warnings) — 0 error(s), 1 warning(s)
@@ -92,7 +92,7 @@ the gallery output.
 - `-o FILE` — output path (default `specreel.yml`).
 
 ```bash
-python specreel.py init test-results/
+specreel init test-results/
 ```
 
 ## `publish <site> --to <target>` — deploy a gallery
@@ -121,7 +121,7 @@ added as new.
 - `-o FILE` — write to a file instead of stdout.
 
 ```bash
-python specreel.py notes site --since prev/manifest.json --product "Acme" -o RELEASE.md
+specreel notes site --since prev/manifest.json --product "Acme" -o RELEASE.md
 ```
 
 ## Environment variables

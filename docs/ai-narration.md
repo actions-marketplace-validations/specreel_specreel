@@ -6,8 +6,8 @@ rewrites those captions into friendlier, sales-engineer-style lines.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python specreel.py test-results/ -o site/ --ai
-python specreel.py trace.zip -o out/ --ai --ai-model claude-haiku-4-5   # cheaper
+specreel test-results/ -o site/ --ai
+specreel trace.zip -o out/ --ai --ai-model claude-haiku-4-5   # cheaper
 ```
 Or enable it in [`specreel.yml`](configuration.md):
 ```yaml

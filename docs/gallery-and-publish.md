@@ -3,7 +3,7 @@
 ## The gallery
 Point Specreel at a directory of traces and it renders a gallery:
 ```bash
-python specreel.py test-results/ -o site/ --bundle
+specreel test-results/ -o site/ --bundle
 ```
 - `site/index.html` — the gallery: one card per flow, each with a **demo** + **test**
   pill (the same artifact), a real end-state thumbnail, duration, and a freshness badge.
@@ -42,16 +42,16 @@ Deploy a generated gallery to a real URL and get an `<iframe>` embed snippet:
 
 ```bash
 # GitHub Pages (needs a GitHub remote): clean single-commit gh-pages force-push
-python specreel.py publish site/ --to ghpages
+specreel publish site/ --to ghpages
 #   pushed gh-pages -> origin
 #   URL (enable once: Settings → Pages → Branch: gh-pages /root):
 #   https://<you>.github.io/<repo>/
 
 # Or copy into any static webroot / synced folder
-python specreel.py publish site/ --to dir:/var/www/demos
+specreel publish site/ --to dir:/var/www/demos
 
 # Or push to Specreel Cloud — a hosted gallery with a dashboard + analytics
-python specreel.py publish site/ --to cloud --project my-app \
+specreel publish site/ --to cloud --project my-app \
   --cloud-url https://app.specreel.dev --token scl_xxx
 ```
 
@@ -64,6 +64,6 @@ To publish automatically on every green build, use the
 ## Notifications
 Post a build summary to Slack (BYO incoming webhook):
 ```bash
-python specreel.py test-results/ -o site/ --notify "$SLACK_WEBHOOK" --url https://acme.github.io/app/
+specreel test-results/ -o site/ --notify "$SLACK_WEBHOOK" --url https://acme.github.io/app/
 ```
 or set `notify_webhook:` / `public_url:` in `specreel.yml`, or `SPECREEL_SLACK_WEBHOOK`.

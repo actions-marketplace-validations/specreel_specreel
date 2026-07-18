@@ -2,7 +2,7 @@
 
 A `specreel.yml` in your working directory (or the traces directory, or passed
 via `--config`) configures a gallery build. It's parsed by a tiny built-in YAML
-subset — no PyYAML needed. Generate a starter with `specreel.py init <traces>`.
+subset — no PyYAML needed. Generate a starter with `specreel init <traces>`.
 
 ```yaml
 title: Acme — Product Flows      # gallery heading / kicker
@@ -57,4 +57,4 @@ flows:                              # keyed by flow slug (matches the gallery ou
 | `healed` | bool | Forces the amber `⟳ updated` state (for a CI self-healing step). |
 
 > Slugs come from the trace's directory name (Playwright names result dirs after
-> the test). `specreel.py init` writes the exact slugs for you.
+> the test). `specreel init` writes the exact slugs for you.

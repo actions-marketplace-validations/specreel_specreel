@@ -84,9 +84,9 @@ jobs:
       - run: pip install playwright && playwright install --with-deps chromium
       - run: python your_flows.py            # re-run the suite -> test-results/*/trace.zip
         env: { BASE_URL: ${{ secrets.STAGING_URL }} }
-      - run: python specreel.py test-results -o site
+      - run: specreel test-results -o site
       - run: |
-          python specreel.py publish site --to cloud --project my-app \
+          specreel publish site --to cloud --project my-app \
             --cloud-url ${{ secrets.SPECREEL_CLOUD_URL }} \
             --token ${{ secrets.SPECREEL_CLOUD_TOKEN }}
 ```

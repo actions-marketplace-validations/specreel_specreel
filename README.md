@@ -31,25 +31,28 @@ pip install "specreel[mcp]"     # + an MCP server, to drive it from an AI coding
 Prefer not to learn the CLI? An MCP server and a Claude Code skill let you drive
 Specreel from Claude Code / Cursor / Claude Desktop — see [integrations/](integrations/README.md).
 
+Running from a checkout instead of an install? Use `python -m specreel …` in place
+of `specreel …` in any command below.
+
 ## Quickstart
 
 **No tests yet?** Point it at your running app — it crawls, suggests flows, and
 scaffolds a runnable Playwright script:
 ```bash
-python specreel.py recommend http://localhost:3000   # -> specreel_flows.py
+specreel recommend http://localhost:3000   # -> specreel_flows.py
 python specreel_flows.py                             # -> test-results/*/trace.zip
-python specreel.py test-results -o site --bundle     # -> the gallery
+specreel test-results -o site --bundle     # -> the gallery
 ```
 
 **Have a trace?** One trace → one demo:
 ```bash
-python specreel.py path/to/trace.zip -o out/ --title "Sign up flow" --mp4
+specreel path/to/trace.zip -o out/ --title "Sign up flow" --mp4
 # -> out/demo.html (self-contained, shareable)   out/demo.mp4 (optional)
 ```
 
 **Have a whole test run?** A directory → a gallery:
 ```bash
-python specreel.py test-results/ -o site/ --bundle
+specreel test-results/ -o site/ --bundle
 # -> site/index.html        gallery, one card per flow
 # -> site/<flow>/demo.html  a player per flow
 # -> site/gallery.html      ONE portable file (gallery + every player inlined)
@@ -85,7 +88,7 @@ Optional layer that rewrites the deterministic captions into friendlier,
 sales-engineer-style lines. **Opt-in, BYO-key, ~<$0.01/flow.**
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python specreel.py test-results/ -o site/ --ai
+specreel test-results/ -o site/ --ai
 ```
 The literal caption stays the source of truth (shown as a sub-line); no key or any
 error degrades gracefully to literal captions; password/secret fields are masked.
@@ -94,7 +97,7 @@ More in [docs/ai-narration.md](docs/ai-narration.md).
 ## Configuration
 A `specreel.yml` (auto-discovered, or `--config`) configures a gallery build —
 parsed by a tiny built-in YAML subset (no PyYAML). Generate one with
-`specreel.py init <traces>`.
+`specreel init <traces>`.
 ```yaml
 title: My App — Product Flows
 product_name: My App        # AI narration says this, not localhost URLs
@@ -110,8 +113,8 @@ Full key reference: [docs/configuration.md](docs/configuration.md).
 
 ## Publishing & sharing
 ```bash
-python specreel.py publish site/ --to ghpages       # gh-pages -> Pages URL + <iframe> embed
-python specreel.py publish site/ --to dir:/var/www  # or copy into any static webroot
+specreel publish site/ --to ghpages       # gh-pages -> Pages URL + <iframe> embed
+specreel publish site/ --to dir:/var/www  # or copy into any static webroot
 ```
 `ghpages` needs a GitHub remote; it builds a clean single-commit `gh-pages` branch,
 force-pushes, and prints the URL + embed snippet. Or just send `site/gallery.html`.
@@ -120,7 +123,7 @@ Post build summaries to Slack with `--notify <webhook>`.
 **Hosted option — Specreel Cloud** (`cloud/`): a self-hostable Flask service for
 hosted galleries with a dashboard, public/private visibility, and view analytics.
 ```bash
-python specreel.py publish site/ --to cloud --project my-app \
+specreel publish site/ --to cloud --project my-app \
   --cloud-url https://cloud.example --token scl_xxx
 ```
 The hosted service is a separate proprietary codebase (open-core) — sign up at
@@ -135,11 +138,11 @@ requests — so the demo can't be older than the last passing build. See
 ## CLI reference
 | Command | Does |
 |---|---|
-| `specreel.py <trace\|dir> -o out` | Render a demo (single) or gallery (directory). |
-| `specreel.py recommend <url>` | Crawl a running app → suggest + scaffold flows. |
-| `specreel.py init <traces>` | Scaffold a `specreel.yml`. |
-| `specreel.py publish <site> --to ghpages\|dir:<p>` | Deploy a gallery to a URL. |
-| `specreel.py summary <site>` | Markdown build summary (for PR comments / CI). |
+| `specreel <trace\|dir> -o out` | Render a demo (single) or gallery (directory). |
+| `specreel recommend <url>` | Crawl a running app → suggest + scaffold flows. |
+| `specreel init <traces>` | Scaffold a `specreel.yml`. |
+| `specreel publish <site> --to ghpages\|dir:<p>` | Deploy a gallery to a URL. |
+| `specreel summary <site>` | Markdown build summary (for PR comments / CI). |
 
 Key flags: `--bundle --ai [--ai-model M] --theme dark|light --mp4 --notify <url> --config f`.
 Full reference: [docs/cli-reference.md](docs/cli-reference.md).

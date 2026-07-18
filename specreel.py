@@ -8,8 +8,8 @@ recorded actions and assertions. No AI. Works on any trace.zip regardless
 of the language the test was written in (JS/TS/Python/Java/.NET).
 
 Usage:
-    python specreel.py path/to/trace.zip -o out/ --title "Sign up flow"
-    python specreel.py path/to/trace.zip -o out/ --mp4
+    specreel path/to/trace.zip -o out/ --title "Sign up flow"
+    specreel path/to/trace.zip -o out/ --mp4
 """
 import argparse, base64, hashlib, html, io, json, os, re, shutil, subprocess, sys, tempfile, zipfile
 from html.parser import HTMLParser
@@ -36,7 +36,13 @@ def load_events(trace_dir):
 # actions that are plumbing, not user-meaningful demo steps
 SKIP_METHODS = {"newPage", "newContext", "close", "setContent", "waitForLoadState",
                 "addInitScript", "setViewportSize", "tracingStart", "tracingStop",
-                "waitForTimeout", "waitForEventInfo", "waitForURL"}
+                "waitForTimeout", "waitForEventInfo", "waitForURL",
+                # synchronization waits are plumbing, not demo-worthy actions;
+                # surfacing them reads as "Wait for the element". Dropping them
+                # also lets a `goto` immediately followed by a wait become the
+                # flow's last step, which then pins to the settled destination.
+                "waitForSelector", "waitForFunction", "waitForResponse",
+                "waitForRequest"}
 
 
 def build_steps(events):
@@ -98,38 +104,53 @@ def coalesce_steps(steps):
 def attach_frames(steps, frames):
     """Pick the screencast frame that best shows each step's *result* state.
 
-    When several fast steps land on the same screencast frame, showing the same
-    image twice reads as a stutter — so if the best frame duplicates the prior
-    step's, prefer the next distinct frame at/after this step's end.
+    Each step pins to its SETTLED result — the last frame before the NEXT step
+    begins. A step's visible outcome persists until the next action, so the frame
+    just before that action shows it fully rendered. This matters most for the
+    opening navigation: a page paints hundreds of ms after `goto` resolves, so a
+    frame picked right after the action would still show the *previous* page —
+    the last-frame-before-next rule shows the loaded destination the caption
+    promises. (For a fast fill/click the settled frame is well past the paint, so
+    this never renders a step "one beat behind" its caption.)
 
     The FINAL step always pins to the trace's last frame: tests often stop tracing
     the instant the last action resolves, so the closest-to-endTime frame can
-    predate the outcome entirely — the demo would end without ever showing where
-    the flow landed. The last captured frame is the truest end state we have.
+    predate the outcome entirely — the last captured frame is the truest end
+    state we have. Consecutive duplicate frames are nudged to avoid a stutter.
     """
+    n = len(steps)
     prev_sha = None
     for i, s in enumerate(steps):
-        if frames and i == len(steps) - 1:
+        if frames and i == n - 1:
             s["frame"] = frames[-1]["sha1"]
+            prev_sha = s["frame"]
             continue
         end = s["end"] if s["end"] is not None else s["start"]
-        # The step must show its RESULT. A frame even 10ms before the action's end
-        # predates the paint (screencast lags fills/clicks), so a nearest-by-distance
-        # pick renders every step one beat behind its caption. Screencast timestamps
-        # also skew ~1 frame early, so prefer the first frame a paint-lag past the
-        # end; fall back to first-at/after, then to the closest before.
-        PAINT_LAG = 100  # ms
-        after = ([fr for fr in frames if fr["timestamp"] >= end + PAINT_LAG]
-                 or [fr for fr in frames if fr["timestamp"] >= end])
-        if after:
-            best = min(after, key=lambda fr: fr["timestamp"])
-        else:
-            best = max(frames, key=lambda fr: fr["timestamp"]) if frames else None
-        if best and best["sha1"] == prev_sha:
-            later = [fr for fr in frames
-                     if fr["timestamp"] >= end and fr["sha1"] != prev_sha]
-            if later:
-                best = min(later, key=lambda fr: fr["timestamp"] - end)
+        nxt = next((steps[j]["start"] for j in range(i + 1, n)
+                    if steps[j].get("start") is not None), None)
+        best = None
+        if frames and nxt is not None:
+            # the settled result: the last frame before the next step starts
+            # (at/after this step's end when such a frame exists).
+            window = ([fr for fr in frames if end <= fr["timestamp"] < nxt]
+                      or [fr for fr in frames if fr["timestamp"] < nxt])
+            if window:
+                best = max(window, key=lambda fr: fr["timestamp"])
+        if best is None and frames:
+            # no next step (or no frame before it): first frame a paint-lag past
+            # this step's end, else the closest available.
+            PAINT_LAG = 100  # ms
+            after = ([fr for fr in frames if fr["timestamp"] >= end + PAINT_LAG]
+                     or [fr for fr in frames if fr["timestamp"] >= end])
+            best = (min(after, key=lambda fr: fr["timestamp"]) if after
+                    else max(frames, key=lambda fr: fr["timestamp"]))
+        # showing the prior step's exact frame again reads as a stutter — prefer a
+        # distinct frame within this step's window if one exists.
+        if best and best["sha1"] == prev_sha and nxt is not None:
+            distinct = [fr for fr in frames
+                        if end <= fr["timestamp"] < nxt and fr["sha1"] != prev_sha]
+            if distinct:
+                best = max(distinct, key=lambda fr: fr["timestamp"])
         s["frame"] = best["sha1"] if best else None
         prev_sha = s["frame"]
 
@@ -1253,7 +1274,7 @@ def publish(site, target, message="specreel: publish gallery", cloud_url=None,
     Targets: 'dir:<path>' | 'ghpages' | 'cloud' (Specreel Cloud)."""
     if not os.path.isdir(site) or not os.path.exists(os.path.join(site, "index.html")):
         sys.stderr.write(f"publish: '{site}' is not a generated gallery "
-                         f"(run `specreel.py <traces> -o {site}` first)\n")
+                         f"(run `specreel <traces> -o {site}` first)\n")
         return 1
 
     if target.startswith("dir:") or target == "dir":
@@ -1286,7 +1307,7 @@ def publish(site, target, message="specreel: publish gallery", cloud_url=None,
             sys.stderr.write(
                 "publish: no 'origin' remote. Create a GitHub repo and run:\n"
                 "  git remote add origin git@github.com:<you>/<repo>.git\n"
-                "then re-run `specreel.py publish %s --to ghpages`.\n" % site)
+                "then re-run `specreel publish %s --to ghpages`.\n" % site)
             return 1
         # build a clean single-commit gh-pages from the site dir and force-push it,
         # without touching the working tree or carrying source history.
@@ -1913,7 +1934,7 @@ def scaffold_script(flows, base, lang="py"):
 
     if lang == "py":
         body = ["\"\"\"Auto-scaffolded by `specreel recommend`. Edit the TODOs, then:",
-                "    python this_file.py && python specreel.py test-results -o site --bundle",
+                "    python this_file.py && specreel test-results -o site --bundle",
                 "Each flow writes test-results/<slug>/trace.zip for specreel to render.\"\"\"",
                 "import asyncio, os, re",
                 "from playwright.async_api import async_playwright, expect", "",
@@ -1948,7 +1969,7 @@ def scaffold_script(flows, base, lang="py"):
 
     # JS / TS
     body = ["// Auto-scaffolded by `specreel recommend`. Edit the TODOs, then:",
-            "//   node this_file.mjs && python specreel.py test-results -o site --bundle",
+            "//   node this_file.mjs && specreel test-results -o site --bundle",
             "import { chromium, expect } from '@playwright/test';",
             "import fs from 'node:fs';", "",
             f"const BASE = process.env.BASE_URL || '{base}';", "", "const FLOWS = ["]
@@ -2301,7 +2322,7 @@ def recommend_main(argv):
         f.write(scaffold)
     say(f"\n  scaffolded -> {out}")
     runner = "python " + out if lang == "py" else "node " + out
-    say(f"  edit the TODOs, then:  {runner} && specreel.py test-results -o site --bundle")
+    say(f"  edit the TODOs, then:  {runner} && specreel test-results -o site --bundle")
     return 0
 
 

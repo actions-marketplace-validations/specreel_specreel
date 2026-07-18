@@ -68,25 +68,25 @@ context.tracing.stop(path="trace.zip")
 
 **2. Preflight** (optional but saves head-scratching):
 ```bash
-python specreel.py doctor test-results
+specreel doctor test-results
 ```
 
 **3. Render a gallery** — one demo per `trace.zip`, plus an index:
 ```bash
-python specreel.py test-results/ -o site/ --bundle
+specreel test-results/ -o site/ --bundle
 # -> site/index.html        the gallery (one card per flow)
 # -> site/<flow>/demo.html  a self-contained player per flow
 # -> site/gallery.html      ONE portable file — email it, Slack it, open from file://
 ```
-(Single trace instead: `python specreel.py trace.zip -o out/ --title "Sign up"`.)
+(Single trace instead: `specreel trace.zip -o out/ --title "Sign up"`.)
 
 **4. Share it** — pick one:
 ```bash
-python specreel.py publish site/ --to cloud \
+specreel publish site/ --to cloud \
   --cloud-url https://app.specreel.dev --token scl_xxx --project my-app
 # -> a stable URL + monitoring/alerts on every publish  (token: dashboard → API tokens)
 
-python specreel.py publish site/ --to ghpages    # or GitHub Pages
+specreel publish site/ --to ghpages    # or GitHub Pages
 ```
 …or just send `site/gallery.html`.
 
