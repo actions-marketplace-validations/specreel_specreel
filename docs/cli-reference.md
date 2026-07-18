@@ -8,6 +8,11 @@ Specreel has one default command (render a trace or a directory) plus a few verb
 - `--title TITLE` — demo title (single-trace mode).
 - `--mp4` — also export `demo.mp4` (needs Pillow + ffmpeg).
 - `--bundle` — also emit a single self-contained `gallery.html` (batch mode).
+- `--strict` — exit non-zero if any flow's first or last step wasn't captured (a
+  truncated demo). For CI: a demo that never recorded its outcome fails the build,
+  like a red test. Every build already prints a `⚠ capture:` warning for such flows;
+  `--strict` turns the warning into a failure. Fix by adding a brief settle
+  (`await page.waitForTimeout(1000)`) at the end of the test.
 - `--theme dark|light` — color theme (default `dark`; or set `theme:` in config).
 - `--config PATH` — path to `specreel.yml` (auto-discovered in CWD / the traces dir otherwise).
 - `--ai` — opt-in [AI narration](ai-narration.md) (needs `ANTHROPIC_API_KEY`).

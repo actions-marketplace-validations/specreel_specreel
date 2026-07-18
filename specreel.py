@@ -155,6 +155,39 @@ def attach_frames(steps, frames):
         prev_sha = s["frame"]
 
 
+def capture_coverage(steps, frames):
+    """Did the trace actually capture both ends of the flow?
+
+    Returns {"opening": bool, "outcome": bool, "issues": [str, ...]}. This is the
+    systematic guard against the recurring "missing first/last step" failure:
+    the engine pins the best available frame to each end (attach_frames), but it
+    can't invent a frame the test never recorded. This detects that gap so a build
+    can WARN (always) or FAIL (--strict) instead of silently shipping a truncated
+    demo. Pure + testable.
+
+    - outcome: a frame exists at/after the last action's end — else the demo ends
+      on the pre-action state (the classic "missing last step").
+    - opening: a frame exists at/after the first step resolved — else the demo
+      opens on a blank/previous page (the "missing first step").
+    """
+    if not steps or not frames:
+        return {"opening": True, "outcome": True, "issues": []}   # empties: other checks handle
+    ts = [fr["timestamp"] for fr in frames]
+    first, last = steps[0], steps[-1]
+    first_end = first["end"] if first["end"] is not None else first["start"]
+    last_end = last["end"] if last["end"] is not None else last["start"]
+    opening = first_end is None or any(t >= first_end for t in ts)
+    outcome = last_end is None or any(t >= last_end for t in ts)
+    issues = []
+    if not opening:
+        issues.append("opening step has no frame after it resolved — the demo may "
+                      "open on a blank or previous page")
+    if not outcome:
+        issues.append("no frame after the last action — the demo ends before the "
+                      "outcome; add a short wait (~1s) at the end of the test")
+    return {"opening": opening, "outcome": outcome, "issues": issues}
+
+
 # ----------------------------------------------------------------------------
 # 2. Humanize selectors, actions, and assertions  (the "captions" engine)
 # ----------------------------------------------------------------------------
@@ -779,6 +812,7 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
         steps = coalesce_steps(steps)
         steps = trim_setup_steps(steps, setup_urls)
         attach_frames(steps, frames)
+        coverage = capture_coverage(steps, frames)
         rendered = render_steps(steps, tmp)
 
         # Phase 3 (opt-in): rewrite captions into narration. Best-effort — the
@@ -816,7 +850,11 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
         sig = hashlib.sha1("\n".join(r["caption"] for r in rendered).encode("utf-8")).hexdigest()[:12]
         stats = {"title": title, "html": html_path, "mp4": mp4_path,
                  "n_actions": n_act, "n_checks": n_chk, "n_steps": len(rendered),
-                 "failed": failed, "duration": duration, "thumb": thumb, "sig": sig}
+                 "failed": failed, "duration": duration, "thumb": thumb, "sig": sig,
+                 "capture": coverage}
+        if coverage["issues"] and verbose:
+            for msg in coverage["issues"]:
+                print(f"  ⚠ capture: {msg}")
         if collect:                                   # for the single-file bundle
             stats["steps"] = step_payload(rendered)
         return stats
@@ -975,6 +1013,9 @@ def build_manifest(entries, out_dir, ctx, title):
             "steps": e["n_steps"], "actions": e["n_actions"], "checks": e["n_checks"],
             "duration": round(e.get("duration", 0), 2), "failed": e["failed"],
             "healed": e.get("healed", False), "sig": e.get("sig", ""),
+            # capture coverage: false = the flow's first/last step wasn't recorded
+            # (a truncated demo). CI can gate on this; the cloud can badge it.
+            "capture_ok": not e.get("capture", {}).get("issues"),
             "demo": f"{e['slug']}/demo.html",
         } for e in entries],
     }
@@ -1052,7 +1093,8 @@ def notify_slack(webhook, payload, timeout=15):
 
 def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
                      ai=False, api_key=None, ai_model=None, bundle=False, theme=None,
-                     notify=None, public_url="", voice=None, tts_model=None, tts_key=None):
+                     notify=None, public_url="", voice=None, tts_model=None, tts_key=None,
+                     strict=False):
     """Batch mode: render every trace under `root` and write an index.html.
 
     Honors an optional specreel.yml: per-flow title/public/hidden, a gallery
@@ -1142,6 +1184,10 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
         flag = ("FAIL" if stats["failed"] else ("updated" if stats["healed"] else "ok"))
         print(f"    {stats['n_steps']} steps · {stats['n_actions']} actions · "
               f"{stats['n_checks']} checks · {fmt_duration(stats['duration'])} · {flag}")
+        # always-on capture check: warn (or, under --strict, fail) when a flow's
+        # first/last step wasn't captured — the recurring "missing step" bug.
+        for msg in stats.get("capture", {}).get("issues", []):
+            sys.stderr.write(f"    ⚠ [{slug}] {msg}\n")
     ctx = gather_build_context()
     index = build_index(entries, out_dir, ctx=ctx, gallery_title=gallery_title,
                         theme=theme, analytics=analytics)
@@ -1158,6 +1204,13 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
         url = public_url or cfg.get("public_url") or ""
         if notify_slack(webhook, build_notify_payload(entries, ctx, gallery_title, url)):
             print("  notified -> Slack")
+    # --strict (CI): a truncated capture is a build failure, like a red test —
+    # so a demo missing its first/last step can't ship silently.
+    truncated = [e["slug"] for e in entries if e.get("capture", {}).get("issues")]
+    if strict and truncated:
+        sys.stderr.write(f"\n  specreel --strict: {len(truncated)} flow(s) with a "
+                         f"capture gap — {', '.join(truncated)}\n")
+        return 1
     return 0
 
 
@@ -2358,7 +2411,8 @@ def diagnose(path):
                 ok = False
                 continue
             steps, frames = build_steps(events)
-            n_steps = len(coalesce_steps(steps))
+            steps = coalesce_steps(steps)
+            n_steps = len(steps)
             total_frames += len(frames)
             if not frames:
                 results.append(("warn", f"{rel}: {n_steps} steps but 0 screencast frames — "
@@ -2366,15 +2420,12 @@ def diagnose(path):
             elif n_steps == 0:
                 results.append(("warn", f"{rel}: no demo-worthy steps (only plumbing?)"))
             else:
-                # tracing stopped the instant the last action resolved? the outcome
-                # never got a frame — the demo would end before showing the result
-                ends = [s["end"] or s["start"] or 0 for s in steps]
-                last_end = max(ends) if ends else 0
-                n_after = sum(1 for fr in frames if fr["timestamp"] >= last_end)
-                if n_after == 0:
-                    results.append(("warn", f"{rel}: {n_steps} steps · {len(frames)} frames, "
-                                    "but none AFTER the last action — add a short wait "
-                                    "(~1s) at the end of the test so the outcome is captured"))
+                # same check the render uses: is each end of the flow captured?
+                cov = capture_coverage(steps, frames)
+                if cov["issues"]:
+                    for msg in cov["issues"]:
+                        results.append(("warn", f"{rel}: {n_steps} steps · {len(frames)} "
+                                        f"frames — {msg}"))
                 else:
                     results.append(("ok", f"{rel}: {n_steps} steps · {len(frames)} frames"))
         except zipfile.BadZipFile:
@@ -2483,6 +2534,9 @@ def main():
                          "tts-1 is cheaper, tts-1-hd higher fidelity)")
     ap.add_argument("--tts-key", default=None,
                     help="OpenAI API key for --voice (else read from OPENAI_API_KEY)")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit non-zero if any flow's first/last step wasn't captured "
+                         "(a truncated demo — for CI, like a failing test)")
     args = ap.parse_args()
 
     if os.path.isdir(args.trace):
@@ -2492,7 +2546,7 @@ def main():
                                   bundle=args.bundle, theme=args.theme,
                                   notify=args.notify, public_url=args.url,
                                   voice=args.voice, tts_model=args.tts_model,
-                                  tts_key=args.tts_key))
+                                  tts_key=args.tts_key, strict=args.strict))
 
     api_key = resolve_api_key(args.api_key)
     if args.ai and not api_key:
@@ -2503,10 +2557,12 @@ def main():
         sys.stderr.write("specreel: --voice set but OPENAI_API_KEY is empty — "
                          "using the browser voice instead\n")
         voice = None
-    generate_demo(args.trace, args.out, title=args.title, want_mp4=args.mp4,
-                  ai=args.ai, api_key=api_key, ai_model=args.ai_model,
-                  theme=args.theme or "dark", voice=voice,
-                  tts_model=args.tts_model, tts_key=tts_key)
+    stats = generate_demo(args.trace, args.out, title=args.title, want_mp4=args.mp4,
+                          ai=args.ai, api_key=api_key, ai_model=args.ai_model,
+                          theme=args.theme or "dark", voice=voice,
+                          tts_model=args.tts_model, tts_key=tts_key)
+    if args.strict and stats.get("capture", {}).get("issues"):
+        sys.exit(1)
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">

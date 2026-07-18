@@ -17,6 +17,9 @@ inputs:
   theme:
     description: "Color theme: dark | light."
     default: "dark"
+  strict:
+    description: "Fail the build if any flow's first/last step wasn't captured (a truncated demo)."
+    default: "false"
   ai:
     description: "Opt-in AI narration ('true'/'false'; needs anthropic-api-key)."
     default: "false"
@@ -69,12 +72,14 @@ runs:
         IN_AI: ${{ inputs.ai }}
         IN_URL: ${{ inputs.url }}
         IN_NOTIFY: ${{ inputs.notify }}
+        IN_STRICT: ${{ inputs.strict }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
       run: |
         set -euo pipefail
         FLAGS=( "$IN_TRACES" -o "$IN_OUT" --theme "$IN_THEME" )
         [ "$IN_BUNDLE" = "true" ] && FLAGS+=( --bundle )
         [ "$IN_AI" = "true" ] && FLAGS+=( --ai )
+        [ "$IN_STRICT" = "true" ] && FLAGS+=( --strict )
         [ -n "$IN_URL" ] && FLAGS+=( --url "$IN_URL" )
         [ -n "$IN_NOTIFY" ] && FLAGS+=( --notify "$IN_NOTIFY" )
         python "$SPECREEL" "${FLAGS[@]}"

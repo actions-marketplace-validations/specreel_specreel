@@ -1026,3 +1026,40 @@ def test_gallery_skips_corrupt_trace(tmp_path, capsys):
     assert (tmp_path / "out" / "good" / "demo.html").exists()
     assert not (tmp_path / "out" / "bad" / "demo.html").exists()
     assert "SKIPPED" in capsys.readouterr().err
+
+
+# ---- capture-coverage guard (systematic "don't miss first/last step") --------
+
+def test_capture_coverage_flags_truncated_end():
+    steps = [{"start": 0, "end": 100}, {"start": 200, "end": 300}]
+    frames_ok = [{"timestamp": t, "sha1": f"s{t}"} for t in (50, 150, 250, 350)]
+    frames_cut = [{"timestamp": t, "sha1": f"s{t}"} for t in (50, 150, 250)]  # none >= 300
+    assert specreel.capture_coverage(steps, frames_ok)["issues"] == []
+    cut = specreel.capture_coverage(steps, frames_cut)
+    assert cut["outcome"] is False and any("last action" in m for m in cut["issues"])
+
+
+def test_capture_coverage_flags_truncated_opening():
+    steps = [{"start": 0, "end": 100}, {"start": 200, "end": 300}]
+    frames = [{"timestamp": 50, "sha1": "a"}]           # nothing at/after first_end=100
+    cov = specreel.capture_coverage(steps, frames)
+    assert cov["opening"] is False and any("open" in m for m in cov["issues"])
+
+
+def test_capture_coverage_neutral_on_empties():
+    assert specreel.capture_coverage([], [])["issues"] == []
+    assert specreel.capture_coverage([{"start": 0, "end": 1}], [])["issues"] == []
+
+
+def test_attach_frames_invariants_first_settled_and_last_is_last():
+    """The two systematic guarantees: the last step pins to the trace's last
+    frame, and no non-final step shows a frame that predates its own action's
+    end (the 'one beat behind' / 'wrong opening frame' regression)."""
+    steps = [{"start": 0, "end": 100}, {"start": 200, "end": 300},
+             {"start": 400, "end": 500}]
+    frames = [{"timestamp": t, "sha1": f"s{t}"} for t in (50, 150, 250, 350, 450, 550)]
+    specreel.attach_frames(steps, frames)
+    assert steps[-1]["frame"] == "s550"                 # last step == last frame
+    by = {f["sha1"]: f["timestamp"] for f in frames}
+    for i, s in enumerate(steps[:-1]):                  # every non-final step is settled
+        assert by[s["frame"]] >= s["end"], f"step {i} shows a pre-action frame"
