@@ -7,6 +7,7 @@ subset — no PyYAML needed. Generate a starter with `specreel init <traces>`.
 ```yaml
 title: Acme — Product Flows      # gallery heading / kicker
 product_name: Acme               # AI narration says this instead of localhost URLs
+quality: high              # motion: high | medium | low (file size tradeoff)
 theme: dark                         # dark | light
 ai: false                           # true (+ ANTHROPIC_API_KEY) to narrate captions
 ai_model: claude-opus-4-8           # model for narration (haiku-4-5 is cheaper)

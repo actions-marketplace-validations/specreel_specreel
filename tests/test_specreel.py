@@ -1063,3 +1063,64 @@ def test_attach_frames_invariants_first_settled_and_last_is_last():
     by = {f["sha1"]: f["timestamp"] for f in frames}
     for i, s in enumerate(steps[:-1]):                  # every non-final step is settled
         assert by[s["frame"]] >= s["end"], f"step {i} shows a pre-action frame"
+
+
+# ---- motion clips, quality, click points, url pill ---------------------------
+
+def _mkframes(ts):
+    return [{"timestamp": t, "sha1": f"s{t}"} for t in ts]
+
+
+def test_attach_clip_frames_builds_motion_window():
+    steps = [{"start": 0, "end": 100}, {"start": 500, "end": 600}]
+    frames = _mkframes([0, 100, 200, 300, 400, 500, 600, 700])
+    specreel.attach_frames(steps, frames)
+    specreel.attach_clip_frames(steps, frames, 14)
+    # step 0's clip covers its own window (before step 1 starts) and ends on its
+    # settled frame; timings are present and the first hold is always 0
+    assert len(steps[0]["clip"]) > 1
+    assert steps[0]["clip"][-1] == steps[0]["frame"]
+    assert steps[0]["clip_dts"][0] == 0
+    assert len(steps[0]["clip_dts"]) == len(steps[0]["clip"])
+    # the final step still ends on the trace's last frame
+    assert steps[-1]["clip"][-1] == "s700"
+
+
+def test_attach_clip_frames_respects_quality_cap():
+    steps = [{"start": 0, "end": 10}]
+    frames = _mkframes(list(range(0, 2000, 50)))     # 40 frames
+    specreel.attach_frames(steps, frames)
+    specreel.attach_clip_frames(steps, frames, 6)
+    assert len(steps[0]["clip"]) <= 6
+    # low quality == a single still (the smallest-file mode)
+    specreel.attach_clip_frames(steps, frames, 1)
+    assert steps[0]["clip"] == [steps[0]["frame"]]
+
+
+def test_quality_levels_defined_high_default():
+    assert specreel.DEFAULT_QUALITY == "high"
+    assert specreel.QUALITY_FRAMES["high"] > specreel.QUALITY_FRAMES["medium"]
+    assert specreel.QUALITY_FRAMES["low"] == 1
+
+
+def test_extract_viewport_and_snapshot_urls():
+    events = [{"type": "context-options", "options": {"viewport": {"width": 1280, "height": 800}}},
+              {"type": "frame-snapshot", "snapshot": {"callId": "c1", "snapshotName": "before@c1",
+                                                      "frameUrl": "http://x/a"}},
+              {"type": "frame-snapshot", "snapshot": {"callId": "c1", "snapshotName": "after@c1",
+                                                      "frameUrl": "http://x/b"}}]
+    assert specreel.extract_viewport(events) == {"width": 1280, "height": 800}
+    # the AFTER snapshot wins: a click that navigates reports where it landed
+    assert specreel._snapshot_urls(events)["c1"] == "http://x/b"
+    assert specreel.final_snapshot_url(events) == "http://x/b"
+
+
+def test_step_payload_motion_toggle_keeps_bundle_small():
+    rendered = [{"caption": "c", "kind": "action", "img": "i2", "imgs": ["i1", "i2"],
+                 "dts": [0, 120], "dur": 1.4, "failed": False, "px": 10.0, "py": 20.0,
+                 "url": "/x"}]
+    full = specreel.step_payload(rendered, motion=True)[0]
+    lite = specreel.step_payload(rendered, motion=False)[0]
+    assert full["imgs"] == ["i1", "i2"] and full["dts"] == [0, 120]
+    assert "imgs" not in lite          # the bundle stays email-sized
+    assert lite["img"] == "i2" and lite["px"] == 10.0 and lite["url"] == "/x"

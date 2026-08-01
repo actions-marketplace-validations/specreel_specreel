@@ -11,7 +11,7 @@ Usage:
     specreel path/to/trace.zip -o out/ --title "Sign up flow"
     specreel path/to/trace.zip -o out/ --mp4
 """
-import argparse, base64, hashlib, html, io, json, os, re, shutil, subprocess, sys, tempfile, zipfile
+import argparse, base64, hashlib, html, io, json, os, re, shutil, subprocess, sys, tempfile, time, zipfile
 from html.parser import HTMLParser
 
 # ----------------------------------------------------------------------------
@@ -45,9 +45,38 @@ SKIP_METHODS = {"newPage", "newContext", "close", "setContent", "waitForLoadStat
                 "waitForRequest"}
 
 
+def final_snapshot_url(events):
+    """The last page URL the trace recorded — where the flow actually ended."""
+    last = ""
+    for e in events:
+        if e.get("type") == "frame-snapshot":
+            u = (e.get("snapshot") or {}).get("frameUrl")
+            if u:
+                last = u
+    return last
+
+
+def _snapshot_urls(events):
+    """callId -> the page URL when that call ran, from frame-snapshot events.
+    Prefer the AFTER snapshot (post-navigation) so a click that navigates
+    reports where it landed, not where it started."""
+    urls = {}
+    for e in events:
+        if e.get("type") != "frame-snapshot":
+            continue
+        snap = e.get("snapshot") or {}
+        cid, name, url = snap.get("callId"), snap.get("snapshotName", ""), snap.get("frameUrl")
+        if not cid or not url:
+            continue
+        if name.startswith("after@") or cid not in urls:
+            urls[cid] = url
+    return urls
+
+
 def build_steps(events):
     befores = {e["callId"]: e for e in events if e.get("type") == "before"}
     afters = {e["callId"]: e for e in events if e.get("type") == "after"}
+    snap_urls = _snapshot_urls(events)
     frames = sorted(
         [e for e in events if e.get("type") == "screencast-frame"],
         key=lambda e: e["timestamp"],
@@ -64,6 +93,12 @@ def build_steps(events):
             "start": b.get("startTime"),
             "end": a.get("endTime", b.get("startTime")),
             "error": a.get("error"),
+            # where the action actually landed (clicks/checks record their
+            # resolved x,y) — powers the player's cursor + click ripple
+            "point": a.get("point"),
+            # the page URL at this step (browser-chrome pill). From the trace's
+            # snapshots, so a click that navigates shows its destination.
+            "url": snap_urls.get(cid),
         })
     steps.sort(key=lambda s: s["start"] if s["start"] is not None else 0)
     return steps, frames
@@ -186,6 +221,77 @@ def capture_coverage(steps, frames):
         issues.append("no frame after the last action — the demo ends before the "
                       "outcome; add a short wait (~1s) at the end of the test")
     return {"opening": opening, "outcome": outcome, "issues": issues}
+
+
+# Frames embedded per step at each quality level. The screencast records ~8fps
+# continuously; playing the frames inside each step's window turns the demo from
+# a slideshow into actual motion (typing types, pages load). More frames = bigger
+# demo.html — the quality knob is that tradeoff, and "high" is the default
+# because the demo IS the product.
+QUALITY_FRAMES = {"high": 14, "medium": 6, "low": 1}
+DEFAULT_QUALITY = "high"
+
+
+def extract_viewport(events):
+    """The recorded viewport (from context-options) — needed to convert a click
+    point's CSS px into a % position over the screenshot. None if absent."""
+    for e in events:
+        if e.get("type") == "context-options":
+            vp = (e.get("options") or {}).get("viewport") or {}
+            if vp.get("width") and vp.get("height"):
+                return {"width": vp["width"], "height": vp["height"]}
+    return None
+
+
+def attach_clip_frames(steps, frames, max_per_step=14):
+    """Give each step a mini-clip: the screencast frames recorded while the step
+    was happening, ending on its settled frame (attach_frames' pick). Runs after
+    attach_frames. Consecutive duplicate frames collapse; when a step recorded
+    more than max_per_step distinct frames, keep the first + last and evenly
+    sample the middle (drops the least motion). max_per_step<=1 = stills mode.
+
+    Sets s["clip"] (sha1 list) and s["clip_dts"] (ms to hold before each frame,
+    first always 0; real gaps clamped to 60..700ms so long waits don't stall
+    playback and bursts stay visible)."""
+    n = len(steps)
+    for i, s in enumerate(steps):
+        final = s.get("frame")
+        if max_per_step <= 1 or not frames:
+            s["clip"] = [final] if final else []
+            s["clip_dts"] = [0] if final else []
+            continue
+        start = s["start"] if s["start"] is not None else s["end"]
+        nxt = (steps[i + 1]["start"] if i + 1 < n
+               and steps[i + 1].get("start") is not None else None)
+        if start is None:
+            window = []
+        elif nxt is not None:
+            window = [f for f in frames if start <= f["timestamp"] < nxt]
+        else:
+            window = [f for f in frames if f["timestamp"] >= start]
+        shas, ts = [], []
+        for f in window:
+            if shas and shas[-1] == f["sha1"]:
+                continue
+            shas.append(f["sha1"])
+            ts.append(f["timestamp"])
+        if final and (not shas or shas[-1] != final):
+            shas.append(final)
+            ts.append((ts[-1] if ts else (start or 0)) + 120)
+        if len(shas) > max_per_step:
+            keep = {0, len(shas) - 1}
+            mid = max_per_step - 2
+            for k in range(1, mid + 1):
+                keep.add(round(k * (len(shas) - 1) / (mid + 1)))
+            idx = sorted(keep)
+            shas = [shas[j] for j in idx]
+            ts = [ts[j] for j in idx]
+        dts, prev = [], None
+        for t in ts:
+            dts.append(0 if prev is None else int(max(60, min(700, t - prev))))
+            prev = t
+        s["clip"] = shas
+        s["clip_dts"] = dts
 
 
 # ----------------------------------------------------------------------------
@@ -559,30 +665,68 @@ def b64_img(path):
         return "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
 
 
-def render_steps(steps, trace_dir):
+def render_steps(steps, trace_dir, viewport=None, final_url=""):
     out = []
+    cur_url = ""
+    vw = (viewport or {}).get("width") or 0
+    vh = (viewport or {}).get("height") or 0
+    b64_cache = {}
+
+    def load(sha):
+        if sha not in b64_cache:
+            fp = os.path.join(trace_dir, "resources", sha)
+            b64_cache[sha] = b64_img(fp) if os.path.exists(fp) else None
+        return b64_cache[sha]
+
     for i, s in enumerate(steps):
         cap, kind = humanize(s)
-        img = None
-        if s.get("frame"):
-            fp = os.path.join(trace_dir, "resources", s["frame"])
-            if os.path.exists(fp):
-                img = b64_img(fp)
+        # the snapshot URL is authoritative (post-navigation); fall back to a
+        # goto's target, else carry the previous step's URL forward
+        if s.get("url"):
+            cur_url = s["url"]
+        elif s.get("method") == "goto" and s.get("params", {}).get("url"):
+            cur_url = s["params"]["url"]
+        imgs = [b for b in (load(sha) for sha in (s.get("clip") or [])) if b]
+        img = imgs[-1] if imgs else (load(s["frame"]) if s.get("frame") else None)
+        dts = (s.get("clip_dts") or [])[:len(imgs)] if imgs else []
+        # click position as % of the viewport — the screencast frame matches the
+        # viewport aspect, so % maps onto the displayed image regardless of scale
+        point = s.get("point") or {}
+        px = round(point["x"] / vw * 100, 2) if point and vw else None
+        py = round(point["y"] / vh * 100, 2) if point and vh else None
         dur = max(1.2, min(4.0, ((s["end"] or 0) - (s["start"] or 0)) / 1000.0 + 0.8))
+        # the last step pins to the trace's final frame (the settled end state),
+        # so show the URL the flow actually ended on — a click that navigates
+        # would otherwise label its destination with the page it left
+        shown_url = final_url if (i == len(steps) - 1 and final_url) else cur_url
         out.append({"i": i + 1, "caption": cap, "kind": kind,
-                    "img": img, "dur": round(dur, 2),
+                    "img": img, "imgs": imgs, "dts": dts,
+                    "px": px, "py": py,
+                    "url": short_url(shown_url) if shown_url else "",
+                    "dur": round(dur, 2),
                     "failed": bool(s.get("error"))})
     return out
 
 
-def step_payload(rendered):
+def step_payload(rendered, motion=True):
     """The per-step data the players consume — narration as the headline, the
-    literal caption as a sub-line. Shared by the single demo and the bundle."""
-    return [{"caption": r.get("narration") or r["caption"],
+    literal caption as a sub-line. Shared by the single demo and the bundle.
+    motion=False (the bundle, an email-sized artifact) keeps one frame per step;
+    motion=True adds each step's clip frames + timings for real playback."""
+    out = []
+    for r in rendered:
+        d = {"caption": r.get("narration") or r["caption"],
              "lit": r["caption"] if r.get("narration") else "",
              "kind": r["kind"], "img": r["img"] or "",
              "dur": r["dur"], "failed": r["failed"],
-             "audio": r.get("audio") or ""} for r in rendered]
+             "audio": r.get("audio") or "",
+             "url": r.get("url") or ""}
+        if r.get("px") is not None:
+            d["px"], d["py"] = r["px"], r["py"]
+        if motion and len(r.get("imgs") or []) > 1:
+            d["imgs"], d["dts"] = r["imgs"], r["dts"]
+        out.append(d)
+    return out
 
 
 def og_meta(title, desc, image=""):
@@ -618,6 +762,7 @@ def build_html(rendered, title, out_dir, theme="dark", analytics=""):
         .replace("__OG__", og_meta(title, "A demo flow generated from a test — always current.")) \
         .replace("__TITLE__", html.escape(title)) \
         .replace("__NACT__", str(n_actions)).replace("__NCHK__", str(n_checks)) \
+        .replace("__DATE__", time.strftime("%b %d, %Y")) \
         .replace("__STEPS__", steps_json)
     path = os.path.join(out_dir, "demo.html")
     with open(path, "w", encoding="utf-8") as f:
@@ -728,59 +873,150 @@ def _load_font(bold, size):
     return ImageFont.load_default(size)
 
 
-def build_mp4(rendered, title, out_dir, trace_dir):
-    from PIL import Image, ImageDraw, ImageFont
+def _card(W, H, kick, headline, sub, accent=(95, 241, 155)):
+    """A title/outro card frame — what turns the export from a screen recording
+    into something that looks produced."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", (W, H), (12, 13, 15))
+    d = ImageDraw.Draw(im)
+    f_k = _load_font(bold=True, size=22)
+    f_h = _load_font(bold=True, size=54)
+    f_s = _load_font(bold=False, size=26)
+    y = H // 2 - 90
+    d.text((80, y), kick, font=f_k, fill=accent)
+    d.text((80, y + 44), headline[:60], font=f_h, fill=(232, 234, 237))
+    d.text((80, y + 122), sub, font=f_s, fill=(139, 146, 152))
+    d.rectangle([80, y + 178, 200, y + 182], fill=accent)
+    return im
+
+
+def _caption_frames(rendered, frames_dir, W=1280, motion=True):
+    """Composite every playable frame (each step's clip, or its single still)
+    with the caption bar. Returns [(path, seconds)] in playback order."""
+    from PIL import Image, ImageDraw
     f_cap = _load_font(bold=True, size=30)
     f_lbl = _load_font(bold=False, size=20)
+    out = []
+    idx = 0
+    for r in rendered:
+        imgs = (r.get("imgs") or []) if motion else []
+        if not imgs:
+            imgs = [r["img"]] if r.get("img") else []
+        if not imgs:
+            continue
+        dts = (r.get("dts") or []) if motion else []
+        # hold each clip frame for its recorded gap; the final frame of a step
+        # holds for the remainder of the step's display duration (the beat that
+        # lets a viewer actually read the caption)
+        for j, b64 in enumerate(imgs):
+            raw = base64.b64decode(b64.split(",", 1)[1])
+            tmp = os.path.join(frames_dir, f"raw_{idx}.jpg")
+            with open(tmp, "wb") as fh:
+                fh.write(raw)
+            im = Image.open(tmp).convert("RGB")
+            if im.width != W:
+                im = im.resize((W, int(im.height * W / im.width)))
+            bar_h = 96
+            canvas = Image.new("RGB", (im.width, im.height + bar_h), (12, 13, 15))
+            canvas.paste(im, (0, 0))
+            d = ImageDraw.Draw(canvas)
+            accent = (95, 241, 155) if r["kind"] != "check" else (127, 182, 255)
+            if r["failed"]:
+                accent = (255, 122, 122)
+            tag = "CHECK" if r["kind"] == "check" else ("NAV" if r["kind"] == "nav" else "STEP")
+            d.text((28, im.height + 20), f"{tag} {r['i']}", font=f_lbl, fill=accent)
+            d.text((28, im.height + 48), r.get("narration") or r["caption"],
+                   font=f_cap, fill=(232, 234, 237))
+            d.rectangle([0, im.height, 6, im.height + bar_h], fill=accent)
+            outp = os.path.join(frames_dir, f"f_{idx:04d}.png")
+            canvas.save(outp)
+            last = (j == len(imgs) - 1)
+            if last:
+                held = sum(dts[1:len(imgs)]) / 1000.0 if len(dts) > 1 else 0
+                dur = max(0.9, r["dur"] - held)
+            else:
+                dur = max(0.08, (dts[j + 1] if j + 1 < len(dts) else 120) / 1000.0)
+            out.append((outp, round(dur, 3)))
+            idx += 1
+    return out
+
+
+def _write_concat(items, path):
+    with open(path, "w", encoding="utf-8") as fh:
+        for p, dur in items:
+            fh.write(f"file '{os.path.abspath(p)}'\nduration {dur}\n")
+        if items:
+            fh.write(f"file '{os.path.abspath(items[-1][0])}'\n")   # hold last
+
+
+def build_mp4(rendered, title, out_dir, trace_dir, failed=False):
+    """Motion MP4: every captured frame, bookended by a title and outcome card."""
+    from PIL import Image
     frames_dir = os.path.join(out_dir, "_frames")
     os.makedirs(frames_dir, exist_ok=True)
-    concat = []
-    idx = 0
-    W = 1280
-    for r in rendered:
-        if not r["img"]:
-            continue
-        # decode the embedded frame back to an image
-        raw = base64.b64decode(r["img"].split(",", 1)[1])
-        tmp = os.path.join(frames_dir, f"raw_{idx}.jpg")
-        with open(tmp, "wb") as fh:
-            fh.write(raw)
-        im = Image.open(tmp).convert("RGB")
-        if im.width != W:
-            im = im.resize((W, int(im.height * W / im.width)))
-        bar_h = 96
-        canvas = Image.new("RGB", (im.width, im.height + bar_h), (12, 13, 15))
-        canvas.paste(im, (0, 0))
-        d = ImageDraw.Draw(canvas)
-        accent = (95, 241, 155) if r["kind"] != "check" else (127, 182, 255)
-        if r["failed"]:
-            accent = (255, 122, 122)
-        tag = "CHECK" if r["kind"] == "check" else ("NAV" if r["kind"] == "nav" else "STEP")
-        d.text((28, im.height + 20), f"{tag} {r['i']}", font=f_lbl, fill=accent)
-        d.text((28, im.height + 48), r.get("narration") or r["caption"],
-               font=f_cap, fill=(232, 234, 237))
-        d.rectangle([0, im.height, 6, im.height + bar_h], fill=accent)
-        outp = os.path.join(frames_dir, f"f_{idx:03d}.png")
-        canvas.save(outp)
-        concat.append((outp, r["dur"]))
-        idx += 1
+    try:
+        items = _caption_frames(rendered, frames_dir)
+        if not items:
+            return None
+        W, H = Image.open(items[0][0]).size
+        n_act = sum(1 for r in rendered if r["kind"] != "check")
+        n_chk = sum(1 for r in rendered if r["kind"] == "check")
+        intro = os.path.join(frames_dir, "a_intro.png")
+        _card(W, H, "DEMO · GENERATED FROM A REAL TEST", title,
+              f"{n_act} actions · {n_chk} checks").save(intro)
+        outro = os.path.join(frames_dir, "z_outro.png")
+        accent = (255, 122, 122) if failed else (95, 241, 155)
+        _card(W, H, "SPECREEL",
+              "This flow is failing" if failed else "Flow verified",
+              ("A step failed on the last run" if failed
+               else "Generated from a passing test") + " · " + time.strftime("%b %d, %Y"),
+              accent=accent).save(outro)
+        items = [(intro, 2.0)] + items + [(outro, 2.6)]
+        listfile = os.path.join(frames_dir, "list.txt")
+        _write_concat(items, listfile)
+        mp4 = os.path.join(out_dir, "demo.mp4")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
+               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
+               "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium", mp4]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr[-800:])
+            return None
+        return mp4
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
-    listfile = os.path.join(frames_dir, "list.txt")
-    with open(listfile, "w", encoding="utf-8") as fh:
-        for p, dur in concat:
-            fh.write(f"file '{os.path.abspath(p)}'\nduration {dur}\n")
-        if concat:
-            fh.write(f"file '{os.path.abspath(concat[-1][0])}'\n")  # last frame hold
-    mp4 = os.path.join(out_dir, "demo.mp4")
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
-           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
-           "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium", mp4]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    shutil.rmtree(frames_dir, ignore_errors=True)
-    if r.returncode != 0:
-        sys.stderr.write(r.stderr[-800:])
-        return None
-    return mp4
+
+def build_gif(rendered, title, out_dir, trace_dir, failed=False, width=900):
+    """Looping GIF — the artifact devs actually paste into a README or a PR.
+    Palette-generated for decent color at a sane size; no title cards (a GIF
+    should start on content), and capped so it stays embeddable."""
+    frames_dir = os.path.join(out_dir, "_gif")
+    os.makedirs(frames_dir, exist_ok=True)
+    try:
+        items = _caption_frames(rendered, frames_dir, W=width)
+        if not items:
+            return None
+        listfile = os.path.join(frames_dir, "list.txt")
+        _write_concat(items, listfile)
+        gif = os.path.join(out_dir, "demo.gif")
+        pal = os.path.join(frames_dir, "pal.png")
+        r1 = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
+                             "-vf", "fps=10,palettegen=stats_mode=diff", pal],
+                            capture_output=True, text=True)
+        if r1.returncode != 0:
+            sys.stderr.write(r1.stderr[-500:])
+            return None
+        r2 = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
+                             "-i", pal, "-lavfi",
+                             "fps=10[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3",
+                             "-loop", "0", gif], capture_output=True, text=True)
+        if r2.returncode != 0:
+            sys.stderr.write(r2.stderr[-500:])
+            return None
+        return gif
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
 
 # ----------------------------------------------------------------------------
@@ -795,7 +1031,8 @@ def fmt_duration(secs):
 def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
                   setup_urls=None, ai=False, api_key=None, ai_model=DEFAULT_AI_MODEL,
                   product="", collect=False, theme="dark", analytics="",
-                  voice=None, tts_model=DEFAULT_TTS_MODEL, tts_key=None):
+                  voice=None, tts_model=DEFAULT_TTS_MODEL, tts_key=None,
+                  quality=DEFAULT_QUALITY, want_gif=False):
     """Render a single trace.zip into out_dir/demo.html (+ optional demo.mp4).
 
     Returns a stats dict: title, html, mp4, n_actions, n_checks, n_steps, failed,
@@ -812,8 +1049,11 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
         steps = coalesce_steps(steps)
         steps = trim_setup_steps(steps, setup_urls)
         attach_frames(steps, frames)
+        attach_clip_frames(steps, frames,
+                           QUALITY_FRAMES.get(quality, QUALITY_FRAMES[DEFAULT_QUALITY]))
         coverage = capture_coverage(steps, frames)
-        rendered = render_steps(steps, tmp)
+        rendered = render_steps(steps, tmp, viewport=extract_viewport(events),
+                                final_url=final_snapshot_url(events))
 
         # Phase 3 (opt-in): rewrite captions into narration. Best-effort — the
         # deterministic captions remain the source of truth on any failure.
@@ -842,9 +1082,13 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
                 print(f"    {mark} {r['caption']}")
         mp4_path = None
         if want_mp4:
-            mp4_path = build_mp4(rendered, title, out_dir, tmp)
+            mp4_path = build_mp4(rendered, title, out_dir, tmp, failed=failed)
             if mp4_path and verbose:
                 print(f"  MP4:  {mp4_path}")
+        if want_gif:
+            gif_path = build_gif(rendered, title, out_dir, tmp, failed=failed)
+            if gif_path and verbose:
+                print(f"  GIF:  {gif_path}")
         # stable signature of the flow (literal captions, not AI narration) — lets
         # the gallery detect "this flow changed since the last build".
         sig = hashlib.sha1("\n".join(r["caption"] for r in rendered).encode("utf-8")).hexdigest()[:12]
@@ -855,8 +1099,8 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
         if coverage["issues"] and verbose:
             for msg in coverage["issues"]:
                 print(f"  ⚠ capture: {msg}")
-        if collect:                                   # for the single-file bundle
-            stats["steps"] = step_payload(rendered)
+        if collect:               # for the single-file bundle: one frame per step
+            stats["steps"] = step_payload(rendered, motion=False)  # (email-sized)
         return stats
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1094,7 +1338,7 @@ def notify_slack(webhook, payload, timeout=15):
 def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
                      ai=False, api_key=None, ai_model=None, bundle=False, theme=None,
                      notify=None, public_url="", voice=None, tts_model=None, tts_key=None,
-                     strict=False):
+                     strict=False, quality=None, want_gif=False):
     """Batch mode: render every trace under `root` and write an index.html.
 
     Honors an optional specreel.yml: per-flow title/public/hidden, a gallery
@@ -1115,6 +1359,9 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
         theme = "dark"
     analytics = cfg.get("analytics") or ""    # raw HTML snippet injected into <head>
     bundle = bundle or bool(cfg.get("bundle"))
+    quality = (quality or cfg.get("quality") or DEFAULT_QUALITY).lower()
+    if quality not in QUALITY_FRAMES:
+        quality = DEFAULT_QUALITY
     ai = ai or bool(cfg.get("ai"))
     ai_model = ai_model or cfg.get("ai_model") or DEFAULT_AI_MODEL
     api_key = resolve_api_key(api_key)
@@ -1167,7 +1414,8 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
                                   want_mp4=want_mp4, verbose=False, setup_urls=setup_urls,
                                   ai=ai, api_key=api_key, ai_model=ai_model, product=product,
                                   collect=bundle, theme=theme, analytics=analytics,
-                                  voice=voice, tts_model=tts_model, tts_key=tts_key)
+                                  voice=voice, tts_model=tts_model, tts_key=tts_key,
+                                  quality=quality, want_gif=want_gif)
         except (zipfile.BadZipFile, OSError, KeyError, json.JSONDecodeError) as e:
             # one corrupt/vanished trace must not abort the other N-1 demos
             sys.stderr.write(f"[{slug}] SKIPPED — unreadable trace "
@@ -2537,6 +2785,12 @@ def main():
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero if any flow's first/last step wasn't captured "
                          "(a truncated demo — for CI, like a failing test)")
+    ap.add_argument("--quality", default=None, choices=list(QUALITY_FRAMES),
+                    help="motion quality: how many screencast frames each step embeds "
+                         "(high=real motion & biggest files [default], medium=lighter, "
+                         "low=one still per step & smallest). Or quality: in specreel.yml")
+    ap.add_argument("--gif", action="store_true",
+                    help="also export demo.gif (needs ffmpeg) — for READMEs and PRs")
     args = ap.parse_args()
 
     if os.path.isdir(args.trace):
@@ -2546,7 +2800,8 @@ def main():
                                   bundle=args.bundle, theme=args.theme,
                                   notify=args.notify, public_url=args.url,
                                   voice=args.voice, tts_model=args.tts_model,
-                                  tts_key=args.tts_key, strict=args.strict))
+                                  tts_key=args.tts_key, strict=args.strict,
+                                  quality=args.quality, want_gif=args.gif))
 
     api_key = resolve_api_key(args.api_key)
     if args.ai and not api_key:
@@ -2560,7 +2815,8 @@ def main():
     stats = generate_demo(args.trace, args.out, title=args.title, want_mp4=args.mp4,
                           ai=args.ai, api_key=api_key, ai_model=args.ai_model,
                           theme=args.theme or "dark", voice=voice,
-                          tts_model=args.tts_model, tts_key=tts_key)
+                          tts_model=args.tts_model, tts_key=tts_key,
+                          quality=args.quality or DEFAULT_QUALITY, want_gif=args.gif)
     if args.strict and stats.get("capture", {}).get("issues"):
         sys.exit(1)
 
@@ -2583,10 +2839,27 @@ min-height:100vh;padding:24px;-webkit-font-smoothing:antialiased}
 .title{font-family:var(--serif);font-size:22px;color:var(--muted)}
 .meta{color:var(--faint);font-size:12px}
 .layout{display:grid;grid-template-columns:1fr 320px;gap:18px}
-.stage{background:#0a0b0d;border:1px solid var(--line);border-radius:12px;overflow:hidden;position:relative;cursor:zoom-in}
+.browser{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#0a0b0d;position:relative}
+.bbar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+.bdots{display:flex;gap:5px}.bdots i{width:9px;height:9px;border-radius:50%;background:#2a2f34;display:block}
+.burl{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:72%}
+.stage{background:#0a0b0d;overflow:hidden;position:relative;cursor:zoom-in}
 .stage.zoomed{cursor:grab}.stage.zoomed.grabbing{cursor:grabbing}
 #shot{transition:transform .12s ease;transform-origin:0 0;will-change:transform}
 .stage img{display:block;width:100%}
+#cursor{position:absolute;width:14px;height:14px;border-radius:50%;background:rgba(95,241,155,.92);border:2px solid rgba(8,9,11,.75);box-shadow:0 1px 6px rgba(0,0,0,.5);transform:translate(-50%,-50%);left:50%;top:50%;transition:left .5s cubic-bezier(.4,0,.2,1),top .5s cubic-bezier(.4,0,.2,1),opacity .3s;pointer-events:none;z-index:5;opacity:0}
+#cursor.vis{opacity:1}
+#cursor.rip::after{content:'';position:absolute;inset:-4px;border-radius:50%;border:2px solid var(--green);animation:rip .6s ease-out forwards}
+@keyframes rip{from{transform:scale(.6);opacity:1}to{transform:scale(2.6);opacity:0}}
+.ovl{position:absolute;inset:0;background:rgba(8,9,11,.84);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:10}
+.ovl.hidden{display:none}
+.ovl .ocard{text-align:center;padding:36px 44px;max-width:80%}
+.ovl .okick{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--green)}
+.ovl h2{font-family:var(--serif);font-weight:400;font-size:30px;margin:10px 0 6px;color:var(--text)}
+.ovl .osub{color:var(--muted);font-size:12.5px;margin-bottom:20px}
+.ovl .obtn{font-family:var(--mono);background:var(--green);color:var(--ink);border:none;border-radius:9px;padding:11px 22px;font-weight:700;font-size:14px;cursor:pointer}
+.ovl .olink{display:block;margin:12px auto 0;color:var(--faint);font-size:11.5px;cursor:pointer;background:none;border:none;font-family:var(--mono)}
+.ovl .ostat{font-size:26px;color:var(--green)}.ovl .ostat.fail{color:var(--red)}
 .cap{position:absolute;left:16px;right:16px;bottom:16px;background:rgba(8,9,11,.86);
 border:1px solid var(--line);border-left:3px solid var(--green);border-radius:10px;padding:11px 14px;backdrop-filter:blur(6px)}
 .cap.check{border-left-color:var(--blue)}.cap.fail{border-left-color:var(--red)}
@@ -2617,7 +2890,12 @@ border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer;f
 <span class="title">&nbsp;__TITLE__</span></div>
 <div class="meta">__NACT__ actions · __NCHK__ checks · regenerated from trace</div></div>
 <div class="layout">
-<div><div class="stage"><img id="shot"><div class="cap" id="cap"><div class="k" id="k"></div><div class="c" id="c"></div><div class="lit" id="lit"></div></div></div>
+<div><div class="browser">
+<div class="bbar"><span class="bdots"><i></i><i></i><i></i></span><span class="burl" id="burl">&nbsp;</span></div>
+<div class="stage"><img id="shot"><div id="cursor"></div><div class="cap" id="cap"><div class="k" id="k"></div><div class="c" id="c"></div><div class="lit" id="lit"></div></div></div>
+<div class="ovl" id="intro"><div class="ocard"><div class="okick">Demo · generated from a real test</div><h2>__TITLE__</h2><div class="osub">__NACT__ actions · __NCHK__ checks</div><button class="obtn" id="ibtn">▶ Play demo</button><button class="olink" id="iskip">browse steps instead</button></div></div>
+<div class="ovl hidden" id="outro"><div class="ocard"><div class="ostat" id="ostat">✓</div><h2 id="otitle">Flow verified</h2><div class="osub" id="osub">Generated from a passing test · __DATE__</div><button class="obtn" id="obtn">↺ Replay</button></div></div>
+</div>
 <div class="controls"><button id="prev">‹ Prev</button><button class="play" id="play">▶ Play</button>
 <button id="next">Next ›</button><button id="tts" title="Read steps aloud">🔊 Off</button><select id="voice" title="Voice (your browser's built-in voices)" style="background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:7px;padding:4px 6px;font-family:inherit;font-size:11px;max-width:140px"></select><div class="bar"><i id="prog"></i></div><span class="meta" id="counter"></span></div></div>
 <div class="side"><h3>Steps</h3><div id="list"></div></div>
@@ -2629,12 +2907,24 @@ const esc=t=>String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 const shot=document.getElementById('shot'),cap=document.getElementById('cap'),
 k=document.getElementById('k'),c=document.getElementById('c'),lit=document.getElementById('lit'),
 prog=document.getElementById('prog'),
-counter=document.getElementById('counter'),list=document.getElementById('list');
+counter=document.getElementById('counter'),list=document.getElementById('list'),
+burl=document.getElementById('burl'),cursor=document.getElementById('cursor'),
+intro=document.getElementById('intro'),outro=document.getElementById('outro');
+let clipT=[];function clearClips(){clipT.forEach(clearTimeout);clipT=[];}
+function clipMs(s){return (s.imgs&&s.imgs.length>1)?s.dts.reduce((a,b)=>a+b,0):0;}
+function placeCursor(s,anim){if(s.px==null){cursor.classList.remove('vis','rip');return;}
+cursor.style.left=s.px+'%';cursor.style.top=s.py+'%';cursor.classList.add('vis');cursor.classList.remove('rip');
+if(anim){void cursor.offsetWidth;clipT.push(setTimeout(()=>cursor.classList.add('rip'),Math.max(380,clipMs(s)-150)));}}
 STEPS.forEach((s,i)=>{const r=document.createElement('div');r.className='row';r.dataset.i=i;
 const kind=s.failed?'fail':s.kind;
 r.innerHTML=`<span class="ix">${String(i+1).padStart(2,'0')}</span><div><div class="t">${esc(s.caption)}</div><span class="pill ${kind}">${s.failed?'failed':s.kind}</span></div>`;
 r.onclick=()=>{stop();show(i)};list.appendChild(r);});
-function show(i){cur=i;const s=STEPS[i];if(s.img)shot.src=s.img;
+function show(i,anim){cur=i;const s=STEPS[i];clearClips();
+if(anim&&s.imgs&&s.imgs.length>1){let t=0;for(let j=0;j<s.imgs.length;j++){t+=j?s.dts[j]:0;
+(j2=>clipT.push(setTimeout(()=>{shot.src=s.imgs[j2];},t)))(j);}}
+else if(s.img)shot.src=s.img;
+if(s.url)burl.textContent=s.url;
+placeCursor(s,!!anim);
 cap.className='cap '+(s.failed?'fail':s.kind);
 k.textContent=(s.failed?'FAILED · ':'')+(s.kind==='check'?'CHECK':(s.kind==='nav'?'NAVIGATE':'ACTION'))+' '+(i+1);
 c.textContent=s.caption;lit.textContent=s.lit||'';lit.style.display=s.lit?'block':'none';playStep(i);
@@ -2643,10 +2933,17 @@ counter.textContent=(i+1)+' / '+STEPS.length;
 [...list.children].forEach((r,j)=>r.classList.toggle('on',j===i));
 list.children[i].scrollIntoView({block:'nearest'});
 try{window.__specreel={step:i+1,total:STEPS.length};}catch(e){}}
-function next(){if(cur<STEPS.length-1)show(cur+1);else stop();}
-function adv(){next();if(playing&&cur<STEPS.length-1)_sched(adv);else if(playing){stop();}}
+function next(anim){if(cur<STEPS.length-1)show(cur+1,anim);else stop();}
+function adv(){if(cur>=STEPS.length-1){stop();showOutro();return;}next(true);if(playing)_sched(adv);}
 function play(){if(playing){stop();return;}playing=true;document.getElementById('play').textContent='❚❚ Pause';
-if(cur>=STEPS.length-1)show(0);else playStep(cur);_sched(adv);}
+intro.classList.add('hidden');outro.classList.add('hidden');
+show(cur>=STEPS.length-1?0:cur,true);_sched(adv);}
+function showOutro(){const bad=STEPS.some(s=>s.failed);
+document.getElementById('ostat').textContent=bad?'✕':'✓';
+document.getElementById('ostat').className='ostat'+(bad?' fail':'');
+document.getElementById('otitle').textContent=bad?'This flow is currently failing':'Flow verified';
+document.getElementById('osub').textContent=(bad?'A step failed on the last run':'Generated from a passing test')+' · __DATE__';
+outro.classList.remove('hidden');}
 function stop(){playing=false;clearTimeout(timer);_next=null;if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();document.getElementById('play').textContent='▶ Play';}
 let tts=false,_voice=null;
 /* prefer a natural/neural browser voice over the robotic system default */
@@ -2664,7 +2961,7 @@ if(sel){sel.innerHTML='';vs.forEach(function(v){var o=document.createElement('op
 sel.onchange=function(){for(var i=0;i<vs.length;i++){if(vs[i].name===sel.value){_voice=vs[i];break;}}if(tts)playStep(cur);};}}catch(e){}}
 var _au=(window.Audio?new Audio():null),_next=null;
 if(_au)_au.onended=function(){clearTimeout(timer);var f=_next;_next=null;if(f)f();};
-function _sched(fn){var s=STEPS[cur];if(tts&&_au&&s&&s.audio){_next=fn;clearTimeout(timer);timer=setTimeout(function(){if(_next===fn){_next=null;fn();}},9000);}else{_next=null;timer=setTimeout(fn,((s&&s.dur)||1.4)*1000);}}
+function _sched(fn){var s=STEPS[cur];if(tts&&_au&&s&&s.audio){_next=fn;clearTimeout(timer);timer=setTimeout(function(){if(_next===fn){_next=null;fn();}},9000);}else{_next=null;timer=setTimeout(fn,Math.max(((s&&s.dur)||1.4)*1000,clipMs(s||{})+700));}}
 function playStep(i){try{if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();}catch(e){}if(!tts)return;var a=STEPS[i]&&STEPS[i].audio;if(a&&_au){try{_au.src=a;var p=_au.play();if(p&&p.catch)p.catch(function(){speak(STEPS[i].caption);});}catch(e){speak(STEPS[i].caption);}}else{speak(STEPS[i].caption);}}
 function speak(t){if(!tts||!window.speechSynthesis)return;try{speechSynthesis.cancel();if(!_voice)_voice=_vsorted()[0]||null;
 var u=new SpeechSynthesisUtterance(t);if(_voice){u.voice=_voice;u.lang=_voice.lang;}u.rate=0.97;u.pitch=1.0;speechSynthesis.speak(u);}catch(e){}}
@@ -2674,7 +2971,12 @@ document.getElementById('prev').onclick=()=>{stop();if(cur>0)show(cur-1);};
 document.getElementById('play').onclick=play;
 const _ttsb=document.getElementById('tts');_ttsb.onclick=()=>{tts=!tts;_ttsb.textContent=tts?'🔊 On':'🔊 Off';if(!tts){if(window.speechSynthesis)speechSynthesis.cancel();}else{playStep(cur);}};
 document.onkeydown=e=>{if(e.key==='ArrowRight'){stop();next();}if(e.key==='ArrowLeft'){stop();if(cur>0)show(cur-1);}if(e.key===' '){e.preventDefault();play();}};
-if(STEPS.length)show(0);else{c.textContent='No demo-worthy steps in this trace.';}
+document.getElementById('ibtn').onclick=play;
+document.getElementById('iskip').onclick=()=>intro.classList.add('hidden');
+document.getElementById('obtn').onclick=()=>{outro.classList.add('hidden');show(0);play();};
+intro.onclick=e=>{if(e.target===intro)intro.classList.add('hidden');};
+outro.onclick=e=>{if(e.target===outro)outro.classList.add('hidden');};
+if(STEPS.length)show(0);else{c.textContent='No demo-worthy steps in this trace.';intro.classList.add('hidden');}
 
 /* manual zoom/pan: click to zoom toward the cursor, drag to pan, click to reset */
 (function(){var st=shot.parentElement,sc=1,ox=0,oy=0,drag=0;

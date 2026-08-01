@@ -144,7 +144,7 @@ requests — so the demo can't be older than the last passing build. See
 | `specreel publish <site> --to ghpages\|dir:<p>` | Deploy a gallery to a URL. |
 | `specreel summary <site>` | Markdown build summary (for PR comments / CI). |
 
-Key flags: `--bundle --ai [--ai-model M] --theme dark|light --mp4 --notify <url> --config f --strict`.
+Key flags: `--bundle --ai [--ai-model M] --theme dark|light --mp4 --notify <url> --config f --strict --quality --gif`.
 Full reference: [docs/cli-reference.md](docs/cli-reference.md).
 
 ## Docs & more

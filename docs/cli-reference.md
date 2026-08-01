@@ -13,6 +13,14 @@ Specreel has one default command (render a trace or a directory) plus a few verb
   like a red test. Every build already prints a `⚠ capture:` warning for such flows;
   `--strict` turns the warning into a failure. Fix by adding a brief settle
   (`await page.waitForTimeout(1000)`) at the end of the test.
+- `--quality high|medium|low` — **motion quality**. Playwright records the screen
+  continuously (~8fps); Specreel plays the frames captured during each step, so
+  typing types and pages load instead of cutting between stills. `high` (default)
+  embeds up to 14 frames per step — real motion, largest files; `medium` ~6 frames;
+  `low` one still per step — smallest files, no motion. Or set `quality:` in
+  `specreel.yml`. (The single-file `gallery.html` bundle always uses one frame per
+  step so it stays email-sized.)
+- `--gif` — also export `demo.gif` (needs `ffmpeg`) — the artifact for READMEs and PRs.
 - `--theme dark|light` — color theme (default `dark`; or set `theme:` in config).
 - `--config PATH` — path to `specreel.yml` (auto-discovered in CWD / the traces dir otherwise).
 - `--ai` — opt-in [AI narration](ai-narration.md) (needs `ANTHROPIC_API_KEY`).
