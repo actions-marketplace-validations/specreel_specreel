@@ -12,6 +12,10 @@ stale.** When it would, a test fails instead.
 > A demo and an end-to-end test are the same artifact: a recorded browser flow.
 > Record/prompt once → replay = demo, share = send, assert = test.
 
+![A Specreel demo: a sign-up flow replayed with captions, generated from a passing test](assets/demo.gif)
+
+<sub>↑ produced by `specreel trace.zip -o out/ --gif` — nothing scripted, that's a real test run.</sub>
+
 Captions are deterministic by default (no AI, no network). AI narration is
 opt-in + BYO-key. Runtime is stdlib-only (Pillow only for `--mp4`); it's one file.
 
