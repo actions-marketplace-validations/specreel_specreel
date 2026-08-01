@@ -46,6 +46,11 @@ specreel publish site --to cloud --project my-app \
 - **Monitoring + break alerts** — the cloud watches every publish and alerts when a
   flow breaks. See below.
 - **Review & sign-off** — comments, build approval, and login-free review links.
+- **Narrated captions, no key needed** — hosted runs narrate your steps into friendly
+  prose automatically (the literal caption stays underneath as the source of truth).
+  With the CLI you'd bring your own key via `--ai`; hosted, it's included.
+- **Your branding** — set an accent color and logo per project (Project settings →
+  Branding) and every hosted demo picks them up immediately, no republish.
 
 ## Monitoring & break alerts (feature A)
 
