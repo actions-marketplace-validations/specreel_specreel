@@ -1353,7 +1353,9 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
     flows_cfg = cfg.get("flows") or {}
     setup_urls = cfg.get("setup_urls") or []
     gallery_title = cfg.get("title") or ""
-    product = cfg.get("product_name") or ""
+    # SPECREEL_PRODUCT lets a host (e.g. Specreel Cloud) name the product for
+    # narration without writing a config file into the user's traces
+    product = cfg.get("product_name") or os.environ.get("SPECREEL_PRODUCT", "")
     theme = (theme or cfg.get("theme") or "dark").lower()
     if theme not in THEME_VARS:
         theme = "dark"
