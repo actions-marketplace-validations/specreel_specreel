@@ -1106,9 +1106,9 @@ def test_quality_levels_defined_high_default():
 def test_extract_viewport_and_snapshot_urls():
     events = [{"type": "context-options", "options": {"viewport": {"width": 1280, "height": 800}}},
               {"type": "frame-snapshot", "snapshot": {"callId": "c1", "snapshotName": "before@c1",
-                                                      "frameUrl": "http://x/a"}},
+                                                      "frameUrl": "http://x/a", "isMainFrame": True}},
               {"type": "frame-snapshot", "snapshot": {"callId": "c1", "snapshotName": "after@c1",
-                                                      "frameUrl": "http://x/b"}}]
+                                                      "frameUrl": "http://x/b", "isMainFrame": True}}]
     assert specreel.extract_viewport(events) == {"width": 1280, "height": 800}
     # the AFTER snapshot wins: a click that navigates reports where it landed
     assert specreel._snapshot_urls(events)["c1"] == "http://x/b"
@@ -1124,3 +1124,34 @@ def test_step_payload_motion_toggle_keeps_bundle_small():
     assert full["imgs"] == ["i1", "i2"] and full["dts"] == [0, 120]
     assert "imgs" not in lite          # the bundle stays email-sized
     assert lite["img"] == "i2" and lite["px"] == 10.0 and lite["url"] == "/x"
+
+
+def test_snapshot_urls_ignore_third_party_iframes():
+    """Pages embed Stripe/analytics/chat iframes whose snapshots carry their own
+    frameUrl. The browser-chrome pill must show the PAGE's address, never an
+    embedded frame's (a real demo showed 'm.stripe.network/inner.html?...')."""
+    def snap(cid, name, url, main):
+        return {"type": "frame-snapshot",
+                "snapshot": {"callId": cid, "snapshotName": name,
+                             "frameUrl": url, "isMainFrame": main}}
+    events = [
+        snap("c1", "after@c1", "https://blog.test/", True),
+        snap("c1", "after@c1", "https://m.stripe.network/inner.html#x", False),
+        snap("c2", "after@c2", "https://blog.test/a-post/", True),
+        snap("c2", "after@c2", "https://m.stripe.network/inner.html#y", False),
+    ]
+    urls = specreel._snapshot_urls(events)
+    assert urls["c1"] == "https://blog.test/"
+    assert urls["c2"] == "https://blog.test/a-post/"
+    # and the flow's end URL is the page's, not the last iframe's
+    assert specreel.final_snapshot_url(events) == "https://blog.test/a-post/"
+
+
+def test_snapshot_urls_skip_about_blank():
+    events = [{"type": "frame-snapshot",
+               "snapshot": {"callId": "c1", "snapshotName": "before@c1",
+                            "frameUrl": "about:blank", "isMainFrame": True}},
+              {"type": "frame-snapshot",
+               "snapshot": {"callId": "c1", "snapshotName": "after@c1",
+                            "frameUrl": "https://blog.test/", "isMainFrame": True}}]
+    assert specreel._snapshot_urls(events)["c1"] == "https://blog.test/"

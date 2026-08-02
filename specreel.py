@@ -45,14 +45,22 @@ SKIP_METHODS = {"newPage", "newContext", "close", "setContent", "waitForLoadStat
                 "waitForRequest"}
 
 
+def _is_main_frame(snap):
+    """Only the top-level frame's URL belongs in the browser chrome. Pages embed
+    third-party iframes (Stripe, analytics, chat widgets) whose snapshots would
+    otherwise surface as the page's address."""
+    return bool(snap.get("isMainFrame")) and not str(
+        snap.get("frameUrl") or "").startswith("about:")
+
+
 def final_snapshot_url(events):
-    """The last page URL the trace recorded — where the flow actually ended."""
+    """The last MAIN-FRAME URL the trace recorded — where the flow ended."""
     last = ""
     for e in events:
         if e.get("type") == "frame-snapshot":
-            u = (e.get("snapshot") or {}).get("frameUrl")
-            if u:
-                last = u
+            snap = e.get("snapshot") or {}
+            if _is_main_frame(snap):
+                last = snap["frameUrl"]
     return last
 
 
@@ -65,11 +73,11 @@ def _snapshot_urls(events):
         if e.get("type") != "frame-snapshot":
             continue
         snap = e.get("snapshot") or {}
-        cid, name, url = snap.get("callId"), snap.get("snapshotName", ""), snap.get("frameUrl")
-        if not cid or not url:
+        cid, name = snap.get("callId"), snap.get("snapshotName", "")
+        if not cid or not _is_main_frame(snap):
             continue
         if name.startswith("after@") or cid not in urls:
-            urls[cid] = url
+            urls[cid] = snap["frameUrl"]
     return urls
 
 
