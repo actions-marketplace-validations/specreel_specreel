@@ -1211,3 +1211,25 @@ def test_recommend_flows_carry_real_clickable_labels():
                         {"text": "Archive", "href": "/b/"}]}]
     flows = specreel.recommend_flows(pages)
     assert flows and "Deploy to Cloud Run" in flows[0]["labels"]
+
+
+def test_keyboard_press_humanized():
+    """page.keyboard.press lands as 'keyboardPress' — it must not leak the raw
+    method name into a caption (the NL resolver is told to use it for scrolling)."""
+    cap, kind = specreel.humanize({"method": "keyboardPress", "params": {"key": "End"}})
+    assert cap == "Jump to the bottom of the page" and kind == "action"
+    assert specreel.humanize({"method": "keyboardPress",
+                              "params": {"key": "Escape"}})[0] == "Dismiss with Escape"
+    # an unmapped key still reads as English, never as a method name
+    cap2, _ = specreel.humanize({"method": "keyboardPress", "params": {"key": "Tab"}})
+    assert cap2 == "Press Tab" and "keyboardPress" not in cap2
+
+
+def test_nl_flow_prompt_forbids_invented_and_fragile_locators():
+    """The system prompt is the guardrail against the two failures we hit on a
+    real site: an invented link name, and a scroll that breaks mid-navigation."""
+    s = specreel.NL_FLOW_SYSTEM
+    assert "NEVER invent the text of a link or button" in s
+    assert "clickable" in s
+    assert "page.evaluate(window.scrollTo" in s or "window.scrollTo" in s
+    assert "mouse.wheel" in s

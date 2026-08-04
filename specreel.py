@@ -504,8 +504,14 @@ def humanize(step):
         tgt = humanize_selector(p.get("selector"))
         val = display_value(p.get("text"), p.get("selector"), tgt)
         return f'Type "{val}" into {tgt}', "action"
-    if m == "press":
-        return f'Press {p.get("key","a key")}', "action"
+    if m in ("press", "keyboardPress"):
+        # page.keyboard.press lands as "keyboardPress" — same idea as a locator
+        # press, and a common way to scroll ("End") or submit ("Enter")
+        key = p.get("key", "a key")
+        friendly = {"End": "Jump to the bottom of the page",
+                    "Home": "Jump to the top of the page",
+                    "Escape": "Dismiss with Escape", "Enter": "Press Enter"}
+        return friendly.get(key, f"Press {key}"), "action"
     if m in ("mouseWheel", "wheel"):
         return "Scroll the page", "action"
     if m == "click":
@@ -2446,6 +2452,12 @@ NL_FLOW_SYSTEM = (
     "TODO. A name that isn't on the page makes the flow fail on the first click.\n"
     "- Prefer `.first` on a locator that could match several elements — an "
     "ambiguous locator is a strict-mode failure, not a passing demo.\n"
+    "- To scroll, use `page.mouse.wheel(0, N)` (repeat for further) or "
+    "`page.keyboard.press(\"End\")` — NEVER page.evaluate(window.scrollTo…): it "
+    "throws while a navigation is in flight, and it renders no visible step in "
+    "the demo. Scrolling via the mouse shows up as a real captioned step.\n"
+    "- After a click that navigates, let the destination settle before acting on "
+    "it (e.g. `await page.wait_for_load_state(\"load\")`).\n"
     "- Add exactly one assertion (expect(...)) for what should be true at the end. "
     "Assert something STABLE (the page title, a permanent UI element) — never "
     "content that changes over time, like the newest post's headline.\n"
