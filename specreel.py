@@ -445,6 +445,48 @@ def display_value(value, selector, name=""):
     return value or ""
 
 
+def humanize_error(err, target=""):
+    """Turn a Playwright failure into one plain-English sentence.
+
+    A red step is only useful if the viewer can tell WHY — and the audience for a
+    demo can't read a Playwright call log. Deterministic (no AI): these messages
+    have stable shapes. Returns "" when there's nothing useful to say.
+    """
+    if not err:
+        return ""
+    if isinstance(err, str):
+        msg, name = err, ""
+    else:
+        msg, name = (err.get("message") or ""), (err.get("name") or "")
+    if not msg:
+        return ""
+    first = msg.strip().splitlines()[0]
+    # humanize_selector already quotes accessible names ('the "Save" button'), so
+    # don't double-quote it
+    what = (target if '"' in (target or "") else f"“{target}”") if target else "that element"
+    # strict mode: the locator matched several elements
+    m = re.search(r"strict mode violation:.*?resolved to (\d+) elements", msg, re.S)
+    if m:
+        return (f"{what} matched {m.group(1)} elements on the page, so it's ambiguous — "
+                "name it more specifically.")
+    # the trace often stores only "Timeout 4000ms exceeded." (no call log), so key
+    # off the error name too rather than requiring the "waiting for" detail
+    if name == "TimeoutError" or first.startswith("Timeout "):
+        secs = re.search(r"Timeout (\d+)ms", first)
+        wait = f" within {int(secs.group(1)) / 1000:g}s" if secs else ""
+        if re.search(r"waiting for .*to be visible", msg):
+            return f"{what} never became visible{wait} — it may be hidden or behind a click."
+        return (f"Couldn't find {what} on the page{wait} — the name may have changed, "
+                "or it only appears after another step.")
+    if "net::ERR_" in msg or "NS_ERROR" in msg:
+        code = re.search(r"(net::ERR_[A-Z_]+)", msg)
+        return (f"The page didn't load ({code.group(1) if code else 'network error'}) — "
+                "check the URL is reachable.")
+    if re.search(r"expect.*to(Be|Have)", first) or "Expected" in msg:
+        return f"The check on {what} didn't hold — the page didn't end up as expected."
+    return first[:160]
+
+
 def humanize(step):
     """Return (caption, kind) where kind in {nav, action, check}."""
     m, p = step["method"], step["params"]
@@ -702,6 +744,9 @@ def render_steps(steps, trace_dir, viewport=None, final_url=""):
         point = s.get("point") or {}
         px = round(point["x"] / vw * 100, 2) if point and vw else None
         py = round(point["y"] / vh * 100, 2) if point and vh else None
+        why = (humanize_error(s.get("error"),
+                              humanize_selector(s.get("params", {}).get("selector")))
+               if s.get("error") else "")
         dur = max(1.2, min(4.0, ((s["end"] or 0) - (s["start"] or 0)) / 1000.0 + 0.8))
         # the last step pins to the trace's final frame (the settled end state),
         # so show the URL the flow actually ended on — a click that navigates
@@ -712,7 +757,7 @@ def render_steps(steps, trace_dir, viewport=None, final_url=""):
                     "px": px, "py": py,
                     "url": short_url(shown_url) if shown_url else "",
                     "dur": round(dur, 2),
-                    "failed": bool(s.get("error"))})
+                    "failed": bool(s.get("error")), "why": why})
     return out
 
 
@@ -728,7 +773,8 @@ def step_payload(rendered, motion=True):
              "kind": r["kind"], "img": r["img"] or "",
              "dur": r["dur"], "failed": r["failed"],
              "audio": r.get("audio") or "",
-             "url": r.get("url") or ""}
+             "url": r.get("url") or "",
+             "why": r.get("why") or ""}   # plain-English reason a step failed
         if r.get("px") is not None:
             d["px"], d["py"] = r["px"], r["py"]
         if motion and len(r.get("imgs") or []) > 1:
@@ -1891,9 +1937,11 @@ class _PageParser(HTMLParser):
         self.links = []
         self._href = None
         self._abuf = ""
+        self._alabel = ""        # aria-label/title fallback for text-less links
         self.buttons = []
         self._btn = False
         self._bbuf = ""
+        self._blabel = ""
         self.forms = []
         self._form = None
         self.inputs = []
@@ -1906,8 +1954,13 @@ class _PageParser(HTMLParser):
             self._htag, self._hbuf = tag, ""
         elif tag == "a" and d.get("href"):
             self._href, self._abuf = d["href"], ""
+            # an overlay/icon link often has NO text and carries its accessible
+            # name in aria-label (or title) — that IS what get_by_role(name=…)
+            # matches, so capture it or the link looks nameless to us
+            self._alabel = d.get("aria-label") or d.get("title") or ""
         elif tag == "button":
             self._btn, self._bbuf = True, ""
+            self._blabel = d.get("aria-label") or d.get("title") or ""
         elif tag == "form":
             self._form = {"action": d.get("action", ""),
                           "method": (d.get("method") or "get").lower(), "fields": []}
@@ -1929,13 +1982,16 @@ class _PageParser(HTMLParser):
                 self.headings.append(t)
             self._htag = None
         elif tag == "a" and self._href is not None:
-            self.links.append({"text": " ".join(self._abuf.split()), "href": self._href})
-            self._href = None
+            txt = " ".join(self._abuf.split()) or " ".join(
+                (getattr(self, "_alabel", "") or "").split())
+            self.links.append({"text": txt, "href": self._href})
+            self._href, self._alabel = None, ""
         elif tag == "button" and self._btn:
-            t = " ".join(self._bbuf.split())
+            t = " ".join(self._bbuf.split()) or " ".join(
+                (getattr(self, "_blabel", "") or "").split())
             if t:
                 self.buttons.append(t)
-            self._btn = False
+            self._btn, self._blabel = False, ""
         elif tag == "form" and self._form is not None:
             self.forms.append(self._form)
             self._form = None
@@ -2094,12 +2150,32 @@ def _fillable(f):
     return f["type"] in _FILLABLE and (f["name"] or f["placeholder"] or f["id"])
 
 
+def page_labels(pg, limit=14):
+    """The clickable things that ACTUALLY exist on a page — link and button text.
+
+    Carried onto every flow so the plain-English resolver can only reference
+    controls that are really there. Without this it invents plausible-sounding
+    names ("Read more") that don't exist, and the flow fails on the first click.
+    """
+    out, seen = [], set()
+    for t in ([l.get("text", "") for l in pg.get("links", [])]
+              + list(pg.get("buttons", []))):
+        t = " ".join((t or "").split())[:60]
+        if t and len(t) > 1 and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def recommend_flows(pages, limit=8):
     """Turn a crawled site map into ranked candidate flows (forms > search > nav)."""
     forms, searches, navs = [], [], []
     for pg in pages:
         head = pg["headings"][0] if pg["headings"] else ""
         short = pg["title"].split("—")[0].split("|")[0].strip() or pg["title"]
+        labels = page_labels(pg)
         for fm in pg["forms"]:
             fields = [x for x in fm["fields"] if _fillable(x)]
             if fields:
@@ -2107,17 +2183,17 @@ def recommend_flows(pages, limit=8):
                 # the submit click as a TODO — the title shouldn't claim otherwise.
                 forms.append({"type": "form", "score": 3, "url": pg["url"],
                               "title": f"Fill the {short} form", "heading": head,
-                              "page_title": short, "fields": fields[:6]})
+                              "page_title": short, "fields": fields[:6], "labels": labels})
         s = next((x for x in pg["inputs"]
                   if x["type"] == "search" or "search" in (x["name"] + x["placeholder"]).lower()), None)
         if s:
             searches.append({"type": "search", "score": 2, "url": pg["url"],
                              "title": f"Search on {short}", "heading": head,
-                             "page_title": short, "fields": [s]})
+                             "page_title": short, "fields": [s], "labels": labels})
         elif not pg["forms"] and head:
             navs.append({"type": "nav", "score": 1, "url": pg["url"],
                          "title": f"Open {short}", "heading": head,
-                         "page_title": short, "fields": []})
+                         "page_title": short, "fields": [], "labels": labels})
     seen, out = set(), []
     for fl in forms + searches + navs:
         if fl["type"] in ("form", "search"):
@@ -2362,6 +2438,14 @@ NL_FLOW_SYSTEM = (
     "- Navigate with `page.goto(BASE + \"/path\")` (BASE is a predefined variable).\n"
     "- Prefer get_by_role / get_by_label / get_by_placeholder, grounded in the given "
     "fields/buttons; fall back to a CSS selector only if needed.\n"
+    "- NEVER invent the text of a link or button. Each page lists its real "
+    "`clickable` text — use one of those strings verbatim. If the thing the user "
+    "described isn't in that list (e.g. they say 'read more' but the page only has "
+    "post titles), pick the closest real entry, or target the element structurally "
+    "(e.g. the first article's link: page.locator(\"article a\").first) and leave a "
+    "TODO. A name that isn't on the page makes the flow fail on the first click.\n"
+    "- Prefer `.first` on a locator that could match several elements — an "
+    "ambiguous locator is a strict-mode failure, not a passing demo.\n"
     "- Add exactly one assertion (expect(...)) for what should be true at the end. "
     "Assert something STABLE (the page title, a permanent UI element) — never "
     "content that changes over time, like the newest post's headline.\n"
@@ -2385,7 +2469,9 @@ def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, 
     failure. BYO-key; never raises."""
     ctx = [{"title": f.get("title"), "url": f.get("url"), "type": f.get("type"),
             "fields": [{"name": x.get("name"), "placeholder": x.get("placeholder"),
-                        "type": x.get("type")} for x in f.get("fields", [])]}
+                        "type": x.get("type")} for x in f.get("fields", [])],
+            # the clickable text that actually exists on this page
+            "clickable": f.get("labels", [])}
            for f in (context_flows or [])]
     payload = {"description": prompt, "language": ("python" if lang == "py" else "javascript"),
                "base_url": base, "known_pages": ctx}
@@ -2618,6 +2704,9 @@ def recommend_main(argv):
                        "page_title": fl.get("page_title", ""),   # keeps the stable
                        # to_have_title assert alive through the cloud wizard path
                        "fields": fl.get("fields", []),
+                       # real link/button text — the NL resolver must only name
+                       # controls that exist, or it invents them and the flow fails
+                       "labels": fl.get("labels", []),
                        "n_fields": len(fl.get("fields", []))} for fl in flows],
             "scaffold": scaffold,
         }))
@@ -2877,6 +2966,9 @@ border:1px solid var(--line);border-left:3px solid var(--green);border-radius:10
 .cap.check .k{color:var(--blue)}.cap.fail .k{color:var(--red)}
 .cap .c{font-size:15px;margin-top:3px}
 .cap .lit{font-size:10.5px;margin-top:3px;color:var(--faint)}
+.cap .why{font-size:12px;margin-top:6px;color:var(--red);display:none}
+.cap.fail .why{display:block}
+.row .why{font-size:11px;color:var(--red);margin-top:4px;line-height:1.3}
 .controls{display:flex;align-items:center;gap:12px;margin-top:14px}
 .controls button{font-family:var(--mono);background:var(--panel);color:var(--text);
 border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
@@ -2902,7 +2994,7 @@ border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer;f
 <div class="layout">
 <div><div class="browser">
 <div class="bbar"><span class="bdots"><i></i><i></i><i></i></span><span class="burl" id="burl">&nbsp;</span></div>
-<div class="stage"><img id="shot"><div id="cursor"></div><div class="cap" id="cap"><div class="k" id="k"></div><div class="c" id="c"></div><div class="lit" id="lit"></div></div></div>
+<div class="stage"><img id="shot"><div id="cursor"></div><div class="cap" id="cap"><div class="k" id="k"></div><div class="c" id="c"></div><div class="lit" id="lit"></div><div class="why" id="why"></div></div></div>
 <div class="ovl" id="intro"><div class="ocard"><div class="okick">Demo · generated from a real test</div><h2>__TITLE__</h2><div class="osub">__NACT__ actions · __NCHK__ checks</div><button class="obtn" id="ibtn">▶ Play demo</button><button class="olink" id="iskip">browse steps instead</button></div></div>
 <div class="ovl hidden" id="outro"><div class="ocard"><div class="ostat" id="ostat">✓</div><h2 id="otitle">Flow verified</h2><div class="osub" id="osub">Generated from a passing test · __DATE__</div><button class="obtn" id="obtn">↺ Replay</button></div></div>
 </div>
@@ -2915,7 +3007,7 @@ const STEPS=__STEPS__;let cur=0,playing=false,timer=null;
 /* trace content (typed values, labels, titles) is untrusted — escape before innerHTML */
 const esc=t=>String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const shot=document.getElementById('shot'),cap=document.getElementById('cap'),
-k=document.getElementById('k'),c=document.getElementById('c'),lit=document.getElementById('lit'),
+k=document.getElementById('k'),c=document.getElementById('c'),lit=document.getElementById('lit'),why=document.getElementById('why'),
 prog=document.getElementById('prog'),
 counter=document.getElementById('counter'),list=document.getElementById('list'),
 burl=document.getElementById('burl'),cursor=document.getElementById('cursor'),
@@ -2927,7 +3019,7 @@ cursor.style.left=s.px+'%';cursor.style.top=s.py+'%';cursor.classList.add('vis')
 if(anim){void cursor.offsetWidth;clipT.push(setTimeout(()=>cursor.classList.add('rip'),Math.max(380,clipMs(s)-150)));}}
 STEPS.forEach((s,i)=>{const r=document.createElement('div');r.className='row';r.dataset.i=i;
 const kind=s.failed?'fail':s.kind;
-r.innerHTML=`<span class="ix">${String(i+1).padStart(2,'0')}</span><div><div class="t">${esc(s.caption)}</div><span class="pill ${kind}">${s.failed?'failed':s.kind}</span></div>`;
+r.innerHTML=`<span class="ix">${String(i+1).padStart(2,'0')}</span><div><div class="t">${esc(s.caption)}</div><span class="pill ${kind}">${s.failed?'failed':s.kind}</span>${s.failed&&s.why?`<div class="why">${esc(s.why)}</div>`:''}</div>`;
 r.onclick=()=>{stop();show(i)};list.appendChild(r);});
 function show(i,anim){cur=i;const s=STEPS[i];clearClips();
 if(anim&&s.imgs&&s.imgs.length>1){let t=0;for(let j=0;j<s.imgs.length;j++){t+=j?s.dts[j]:0;
@@ -2937,7 +3029,7 @@ if(s.url)burl.textContent=s.url;
 placeCursor(s,!!anim);
 cap.className='cap '+(s.failed?'fail':s.kind);
 k.textContent=(s.failed?'FAILED · ':'')+(s.kind==='check'?'CHECK':(s.kind==='nav'?'NAVIGATE':'ACTION'))+' '+(i+1);
-c.textContent=s.caption;lit.textContent=s.lit||'';lit.style.display=s.lit?'block':'none';playStep(i);
+c.textContent=s.caption;lit.textContent=s.lit||'';lit.style.display=s.lit?'block':'none';if(why)why.textContent=s.why||'';playStep(i);
 prog.style.width=((i+1)/STEPS.length*100)+'%';
 counter.textContent=(i+1)+' / '+STEPS.length;
 [...list.children].forEach((r,j)=>r.classList.toggle('on',j===i));
@@ -3186,6 +3278,9 @@ min-height:100vh;padding:22px;-webkit-font-smoothing:antialiased}
 .cap .k{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--green)}
 .cap.check .k{color:var(--blue)}.cap.fail .k{color:var(--red)}
 .cap .c{font-size:15px;margin-top:3px}.cap .lit{font-size:10.5px;margin-top:3px;color:var(--faint)}
+.cap .why{font-size:12px;margin-top:6px;color:var(--red);display:none}
+.cap.fail .why{display:block}
+.row .why{font-size:11px;color:var(--red);margin-top:4px;line-height:1.3}
 .controls{display:flex;align-items:center;gap:12px;margin-top:14px}
 .controls button{font-family:var(--mono);background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
 .controls button.play{background:var(--green);color:var(--ink);border:none;font-weight:700}
@@ -3213,7 +3308,7 @@ min-height:100vh;padding:22px;-webkit-font-smoothing:antialiased}
 </div>
 <div class="view" id="player">
 <span class="back" id="back">‹ all flows</span><div class="ptitle" id="ptitle"></div>
-<div class="layout"><div><div class="stage"><img id="shot"><div class="cap" id="cap"><div class="k" id="k"></div><div class="c" id="c"></div><div class="lit" id="lit"></div></div></div>
+<div class="layout"><div><div class="stage"><img id="shot"><div class="cap" id="cap"><div class="k" id="k"></div><div class="c" id="c"></div><div class="lit" id="lit"></div><div class="why" id="why"></div></div></div>
 <div class="controls"><button id="prev">‹ Prev</button><button class="play" id="play">▶ Play</button>
 <button id="next">Next ›</button><button id="tts" title="Read steps aloud">🔊 Off</button><select id="voice" title="Voice (your browser's built-in voices)" style="background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:7px;padding:4px 6px;font-family:inherit;font-size:11px;max-width:140px"></select><div class="bar"><i id="prog"></i></div><span class="meta" id="counter"></span></div></div>
 <div class="side"><h3>Steps</h3><div id="list"></div></div></div>
@@ -3244,14 +3339,14 @@ return '<div class="card'+(f.failed?' fail':(f.healed?' heal':''))+'" data-slug=
 [...el('grid').children].forEach(c=>c.onclick=()=>{location.hash='#'+c.dataset.slug;});
 // player
 let STEPS=[],cur=0,playing=false,timer=null,touring=false,tourIdx=0;
-const shot=el('shot'),cap=el('cap'),k=el('k'),c=el('c'),lit=el('lit'),prog=el('prog'),counter=el('counter'),list=el('list');
+const shot=el('shot'),cap=el('cap'),k=el('k'),c=el('c'),lit=el('lit'),why=el('why'),prog=el('prog'),counter=el('counter'),list=el('list');
 function buildList(){list.innerHTML='';STEPS.forEach((s,i)=>{const r=document.createElement('div');r.className='row';
 const kind=s.failed?'fail':s.kind;
-r.innerHTML='<span class="ix">'+String(i+1).padStart(2,'0')+'</span><div><div class="t">'+esc(s.caption)+'</div><span class="pill2 p2 '+kind+'">'+(s.failed?'failed':s.kind)+'</span></div>';
+r.innerHTML='<span class="ix">'+String(i+1).padStart(2,'0')+'</span><div><div class="t">'+esc(s.caption)+'</div><span class="pill2 p2 '+kind+'">'+(s.failed?'failed':s.kind)+'</span>'+((s.failed&&s.why)?'<div class="why">'+esc(s.why)+'</div>':'')+'</div>';
 r.onclick=()=>{stop();show(i)};list.appendChild(r);});}
 function show(i){cur=i;const s=STEPS[i];if(s.img)shot.src=s.img;cap.className='cap '+(s.failed?'fail':s.kind);
 k.textContent=(s.failed?'FAILED · ':'')+(s.kind==='check'?'CHECK':(s.kind==='nav'?'NAVIGATE':'ACTION'))+' '+(i+1);
-c.textContent=s.caption;lit.textContent=s.lit||'';lit.style.display=s.lit?'block':'none';playStep(i);
+c.textContent=s.caption;lit.textContent=s.lit||'';lit.style.display=s.lit?'block':'none';if(why)why.textContent=s.why||'';playStep(i);
 prog.style.width=((i+1)/STEPS.length*100)+'%';counter.textContent=(i+1)+' / '+STEPS.length;
 [...list.children].forEach((r,j)=>r.classList.toggle('on',j===i));list.children[i].scrollIntoView({block:'nearest'});}
 function next(){if(cur<STEPS.length-1)show(cur+1);else stop();}

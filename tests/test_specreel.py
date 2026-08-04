@@ -1155,3 +1155,59 @@ def test_snapshot_urls_skip_about_blank():
                "snapshot": {"callId": "c1", "snapshotName": "after@c1",
                             "frameUrl": "https://blog.test/", "isMainFrame": True}}]
     assert specreel._snapshot_urls(events)["c1"] == "https://blog.test/"
+
+
+# ---- failure legibility + locator grounding ---------------------------------
+
+def test_humanize_error_explains_a_missing_element():
+    err = {"message": "Timeout 4000ms exceeded.", "name": "TimeoutError"}
+    why = specreel.humanize_error(err, 'the "Read more" link')
+    assert "Couldn't find" in why and '"Read more"' in why and "4s" in why
+    assert "Timeout" not in why          # no raw Playwright jargon
+
+
+def test_humanize_error_explains_an_ambiguous_locator():
+    err = {"message": 'Error: strict mode violation: get_by_role("link") resolved to '
+                      '2 elements:\n 1) <a>A</a>\n 2) <a>B</a>'}
+    why = specreel.humanize_error(err, "the link")
+    assert "matched 2 elements" in why and "ambiguous" in why
+
+
+def test_humanize_error_quiet_when_nothing_useful():
+    assert specreel.humanize_error(None) == ""
+    assert specreel.humanize_error({"message": ""}) == ""
+
+
+def test_page_parser_reads_aria_label_for_textless_links():
+    """Overlay/icon links carry their accessible name in aria-label — that's what
+    get_by_role(name=…) matches, so a crawl that ignores it reports the page as
+    having no clickable post titles (and the AI then invents 'Read more')."""
+    html_doc = ('<html><body>'
+                '<a href="/a/" aria-label="Deploy to Cloud Run"></a>'
+                '<a href="/b/">Plain text link</a>'
+                '<button aria-label="Open search"><svg></svg></button>'
+                '</body></html>')
+    p = specreel._PageParser()
+    p.feed(html_doc)
+    texts = [l["text"] for l in p.links]
+    assert "Deploy to Cloud Run" in texts      # from aria-label
+    assert "Plain text link" in texts          # normal text still wins
+    assert "Open search" in p.buttons
+
+
+def test_page_labels_dedupes_and_caps():
+    pg = {"links": [{"text": "Home"}, {"text": "home"}, {"text": ""}, {"text": "Docs"}],
+          "buttons": ["Search"]}
+    labels = specreel.page_labels(pg)
+    assert labels == ["Home", "Docs", "Search"]     # case-insensitive dedupe, no blanks
+    many = {"links": [{"text": f"L{i}"} for i in range(40)], "buttons": []}
+    assert len(specreel.page_labels(many, limit=5)) == 5
+
+
+def test_recommend_flows_carry_real_clickable_labels():
+    pages = [{"url": "http://x/", "title": "Blog", "headings": ["Blog"], "forms": [],
+              "inputs": [], "buttons": [],
+              "links": [{"text": "Deploy to Cloud Run", "href": "/a/"},
+                        {"text": "Archive", "href": "/b/"}]}]
+    flows = specreel.recommend_flows(pages)
+    assert flows and "Deploy to Cloud Run" in flows[0]["labels"]
