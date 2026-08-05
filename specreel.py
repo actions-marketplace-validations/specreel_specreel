@@ -2089,7 +2089,19 @@ def crawl(base, max_pages=12, fetch=None, headers=None):
 # the live DOM after JS runs, so single-page apps map richly.
 _BROWSER_EXTRACT = r"""() => {
   const t = el => (el.textContent || '').trim().replace(/\s+/g, ' ');
+  // visible === can Playwright act on it? A field that exists but is hidden
+  // (a search box inside a closed modal) makes .fill() time out unless the flow
+  // opens it first — so record it, and what probably opens it.
+  const vis = e => !!(e.offsetParent || e.getClientRects().length);
+  const opener = i => {
+    const d = i.closest('[role=dialog],.modal,dialog,[aria-modal]');
+    const guess = [...document.querySelectorAll('button,[role=button],a[aria-label]')]
+      .map(b => b.getAttribute('aria-label') || (b.textContent || '').trim())
+      .filter(x => x && /search|menu|filter|open/i.test(x));
+    return (d && guess.length) ? guess[0] : '';
+  };
   const fieldOf = i => ({name: i.name || '', placeholder: i.placeholder || '', id: i.id || '',
+    visible: vis(i), opened_by: vis(i) ? '' : opener(i),
     type: i.tagName === 'TEXTAREA' ? 'textarea' : ((i.getAttribute('type') || 'text').toLowerCase())});
   const skip = new Set(['hidden','submit','button','checkbox','radio','file','image','reset']);
   const inputs = [...document.querySelectorAll('input,textarea')].map(fieldOf).filter(f => !skip.has(f.type));
@@ -2452,6 +2464,15 @@ NL_FLOW_SYSTEM = (
     "TODO. A name that isn't on the page makes the flow fail on the first click.\n"
     "- Prefer `.first` on a locator that could match several elements — an "
     "ambiguous locator is a strict-mode failure, not a passing demo.\n"
+    "- A field with \"visible\": false EXISTS but is hidden (typically a search "
+    "box inside a closed modal). You MUST click the control that reveals it "
+    "first — use its \"opened_by\" name, e.g. page.get_by_role(\"button\", name=\"Search\").first.click() — then fill it. "
+    "Filling a hidden field just times out.\n"
+    "- For content that only appears AFTER an action (search results, a dropdown) "
+    "you cannot know its markup — do NOT invent class names like \".search-results "
+    "a\". Prefer a role-based locator scoped to the container, e.g. "
+    "page.locator(\"[role=dialog], .modal\").get_by_role(\"link\").first, and leave "
+    "a TODO so the author can tighten it.\n"
     "- To scroll, use `page.mouse.wheel(0, N)` (repeat for further) or "
     "`page.keyboard.press(\"End\")` — NEVER page.evaluate(window.scrollTo…): it "
     "throws while a navigation is in flight, and it renders no visible step in "
@@ -2473,6 +2494,44 @@ NL_FLOW_SCHEMA = {
     "required": ["title", "code"], "additionalProperties": False}
 
 
+def normalize_flow_code(code, lang):
+    """Make a generated flow body safe to run, or return "" if it can't be.
+
+    A model asked for Python occasionally emits a `//` comment (JS habit), which
+    is a SyntaxError — the whole flow then dies at import time with a message
+    that has nothing to do with the user's app. Normalize the obvious slips and
+    then actually compile Python before we hand it back."""
+    if not code:
+        return ""
+    lines = code.strip().splitlines()
+    if lang == "py":
+        fixed = []
+        for ln in lines:
+            stripped = ln.lstrip()
+            if stripped.startswith("//"):        # JS comment in Python
+                ln = ln[:len(ln) - len(stripped)] + "#" + stripped[2:]
+            # JS regex literal in a matcher: to_have_title(/Dylan Roy/i)
+            # -> to_have_title(re.compile("Dylan Roy", re.I))   (scaffold imports re)
+            ln = re.sub(r'\(/(.+?)/([a-z]*)\)',
+                        lambda m: '(re.compile("%s"%s))' % (
+                            m.group(1).replace('\\', '\\\\').replace('"', '\\"'),
+                            ", re.I" if "i" in m.group(2) else ""),
+                        ln)
+            fixed.append(ln)
+        lines = fixed
+        body = "\n".join("    " + ln for ln in lines) or "    pass"
+        try:
+            compile("async def _f(page, BASE, expect):\n" + body, "<flow>", "exec")
+        except SyntaxError as e:
+            sys.stderr.write(f"nl_flow: generated python didn't compile ({e.msg} "
+                             f"at line {e.lineno}) — discarding\n")
+            return ""
+    else:
+        lines = [("//" + ln.lstrip()[1:] if ln.lstrip().startswith("#") else ln)
+                 for ln in lines]
+    return "\n".join(lines)
+
+
 def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, timeout=60,
             var_names=None):
     """Turn a plain-English description into a runnable flow, grounded in the crawled
@@ -2481,7 +2540,11 @@ def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, 
     failure. BYO-key; never raises."""
     ctx = [{"title": f.get("title"), "url": f.get("url"), "type": f.get("type"),
             "fields": [{"name": x.get("name"), "placeholder": x.get("placeholder"),
-                        "type": x.get("type")} for x in f.get("fields", [])],
+                        "type": x.get("type"),
+                        # False => hidden until something opens it (a modal)
+                        "visible": x.get("visible", True),
+                        "opened_by": x.get("opened_by", "")}
+                       for x in f.get("fields", [])],
             # the clickable text that actually exists on this page
             "clickable": f.get("labels", [])}
            for f in (context_flows or [])]
@@ -2497,7 +2560,7 @@ def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, 
         resp = _anthropic_messages(body, api_key, timeout=timeout)
         text = next((b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"), "")
         obj = json.loads(text) if text else {}
-        code = (obj.get("code") or "").strip()
+        code = normalize_flow_code((obj.get("code") or "").strip(), lang)
         if not code:
             return None
         return {"title": obj.get("title") or prompt[:48], "type": "custom",
@@ -2954,7 +3017,7 @@ min-height:100vh;padding:24px;-webkit-font-smoothing:antialiased}
 .bbar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
 .bdots{display:flex;gap:5px}.bdots i{width:9px;height:9px;border-radius:50%;background:#2a2f34;display:block}
 .burl{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:72%}
-.stage{background:#0a0b0d;overflow:hidden;position:relative;cursor:zoom-in}
+.stage{background:#0a0b0d;overflow:hidden;position:relative;cursor:pointer}
 .stage.zoomed{cursor:grab}.stage.zoomed.grabbing{cursor:grabbing}
 #shot{transition:transform .12s ease;transform-origin:0 0;will-change:transform}
 .stage img{display:block;width:100%}
@@ -3033,7 +3096,7 @@ STEPS.forEach((s,i)=>{const r=document.createElement('div');r.className='row';r.
 const kind=s.failed?'fail':s.kind;
 r.innerHTML=`<span class="ix">${String(i+1).padStart(2,'0')}</span><div><div class="t">${esc(s.caption)}</div><span class="pill ${kind}">${s.failed?'failed':s.kind}</span>${s.failed&&s.why?`<div class="why">${esc(s.why)}</div>`:''}</div>`;
 r.onclick=()=>{stop();show(i)};list.appendChild(r);});
-function show(i,anim){cur=i;const s=STEPS[i];clearClips();
+function show(i,anim){cur=i;const s=STEPS[i];clearClips();try{window.__srResetZoom&&window.__srResetZoom();}catch(e){}
 if(anim&&s.imgs&&s.imgs.length>1){let t=0;for(let j=0;j<s.imgs.length;j++){t+=j?s.dts[j]:0;
 (j2=>clipT.push(setTimeout(()=>{shot.src=s.imgs[j2];},t)))(j);}}
 else if(s.img)shot.src=s.img;
@@ -3092,12 +3155,26 @@ intro.onclick=e=>{if(e.target===intro)intro.classList.add('hidden');};
 outro.onclick=e=>{if(e.target===outro)outro.classList.add('hidden');};
 if(STEPS.length)show(0);else{c.textContent='No demo-worthy steps in this trace.';intro.classList.add('hidden');}
 
-/* manual zoom/pan: click to zoom toward the cursor, drag to pan, click to reset */
-(function(){var st=shot.parentElement,sc=1,ox=0,oy=0,drag=0;
+/* Click = play/pause (what everyone expects of a player). Zoom is a DELIBERATE
+   gesture: double-click toward a point, drag to pan, double-click to reset.
+   Single-click used to zoom, so the natural "tap the video" instinct looked
+   like the demo randomly zooming in on a step. */
+(function(){var st=shot.parentElement,sc=1,ox=0,oy=0,drag=0,dbl=0;
 function aT(){shot.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')';}
 function rs(){sc=1;ox=0;oy=0;shot.style.transformOrigin='0 0';aT();st.classList.remove('zoomed');}
-shot.addEventListener('load',rs);
-st.addEventListener('click',function(e){if(drag)return;if(sc===1){var r=st.getBoundingClientRect();shot.style.transformOrigin=((e.clientX-r.left)/r.width*100)+'% '+((e.clientY-r.top)/r.height*100)+'%';sc=2.2;ox=0;oy=0;st.classList.add('zoomed');aT();}else{rs();}});
+window.__srResetZoom=rs;                     /* show() clears zoom on step change */
+shot.addEventListener('load',function(){if(sc===1)rs();});  /* keep an intentional zoom while a clip plays */
+st.addEventListener('click',function(e){
+  if(drag||dbl)return;
+  setTimeout(function(){if(!dbl)play();},220);   /* single click -> play/pause */
+});
+st.addEventListener('dblclick',function(e){
+  dbl=1;setTimeout(function(){dbl=0;},420);
+  if(sc===1){var r=st.getBoundingClientRect();
+    shot.style.transformOrigin=((e.clientX-r.left)/r.width*100)+'% '+((e.clientY-r.top)/r.height*100)+'%';
+    sc=2.2;ox=0;oy=0;st.classList.add('zoomed');aT();}
+  else{rs();}
+});
 st.addEventListener('mousedown',function(e){if(sc===1)return;e.preventDefault();drag=0;var px=e.clientX,py=e.clientY,bx=ox,by=oy;st.classList.add('grabbing');
 function mm(ev){ox=bx+(ev.clientX-px);oy=by+(ev.clientY-py);if(Math.abs(ev.clientX-px)+Math.abs(ev.clientY-py)>3)drag=1;aT();}
 function mu(){document.removeEventListener('mousemove',mm);document.removeEventListener('mouseup',mu);st.classList.remove('grabbing');setTimeout(function(){drag=0;},0);}
@@ -3281,7 +3358,7 @@ min-height:100vh;padding:22px;-webkit-font-smoothing:antialiased}
 .back:hover{color:var(--text)}
 .ptitle{font-family:var(--serif);font-size:22px;margin-bottom:14px}
 .layout{display:grid;grid-template-columns:1fr 320px;gap:18px}
-.stage{background:#0a0b0d;border:1px solid var(--line);border-radius:12px;overflow:hidden;position:relative;cursor:zoom-in}
+.stage{background:#0a0b0d;border:1px solid var(--line);border-radius:12px;overflow:hidden;position:relative;cursor:pointer}
 .stage.zoomed{cursor:grab}.stage.zoomed.grabbing{cursor:grabbing}
 #shot{transition:transform .12s ease;transform-origin:0 0;will-change:transform}
 .stage img{display:block;width:100%}
@@ -3403,12 +3480,26 @@ function route(){touring=false;const slug=decodeURIComponent(location.hash.repla
 if(f){openFlow(f);}else{stop();el('player').classList.remove('on');el('gallery').classList.add('on');}}
 window.addEventListener('hashchange',route);route();
 
-/* manual zoom/pan: click to zoom toward the cursor, drag to pan, click to reset */
-(function(){var st=shot.parentElement,sc=1,ox=0,oy=0,drag=0;
+/* Click = play/pause (what everyone expects of a player). Zoom is a DELIBERATE
+   gesture: double-click toward a point, drag to pan, double-click to reset.
+   Single-click used to zoom, so the natural "tap the video" instinct looked
+   like the demo randomly zooming in on a step. */
+(function(){var st=shot.parentElement,sc=1,ox=0,oy=0,drag=0,dbl=0;
 function aT(){shot.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')';}
 function rs(){sc=1;ox=0;oy=0;shot.style.transformOrigin='0 0';aT();st.classList.remove('zoomed');}
-shot.addEventListener('load',rs);
-st.addEventListener('click',function(e){if(drag)return;if(sc===1){var r=st.getBoundingClientRect();shot.style.transformOrigin=((e.clientX-r.left)/r.width*100)+'% '+((e.clientY-r.top)/r.height*100)+'%';sc=2.2;ox=0;oy=0;st.classList.add('zoomed');aT();}else{rs();}});
+window.__srResetZoom=rs;                     /* show() clears zoom on step change */
+shot.addEventListener('load',function(){if(sc===1)rs();});  /* keep an intentional zoom while a clip plays */
+st.addEventListener('click',function(e){
+  if(drag||dbl)return;
+  setTimeout(function(){if(!dbl)play();},220);   /* single click -> play/pause */
+});
+st.addEventListener('dblclick',function(e){
+  dbl=1;setTimeout(function(){dbl=0;},420);
+  if(sc===1){var r=st.getBoundingClientRect();
+    shot.style.transformOrigin=((e.clientX-r.left)/r.width*100)+'% '+((e.clientY-r.top)/r.height*100)+'%';
+    sc=2.2;ox=0;oy=0;st.classList.add('zoomed');aT();}
+  else{rs();}
+});
 st.addEventListener('mousedown',function(e){if(sc===1)return;e.preventDefault();drag=0;var px=e.clientX,py=e.clientY,bx=ox,by=oy;st.classList.add('grabbing');
 function mm(ev){ox=bx+(ev.clientX-px);oy=by+(ev.clientY-py);if(Math.abs(ev.clientX-px)+Math.abs(ev.clientY-py)>3)drag=1;aT();}
 function mu(){document.removeEventListener('mousemove',mm);document.removeEventListener('mouseup',mu);st.classList.remove('grabbing');setTimeout(function(){drag=0;},0);}

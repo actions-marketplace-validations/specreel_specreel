@@ -241,8 +241,11 @@ def test_gallery_filter_and_player_zoom(tmp_path):
     assert 'id="toolbar"' in idx and "data-status=" in idx and "data-title=" in idx
     assert "getElementById('q')" in idx                  # filter wired
     demo = next(out.glob("*/demo.html")).read_text()
-    assert "click to zoom toward" in demo and ".stage.zoomed" in demo   # player zoom/pan
-    assert "click to zoom toward" in (out / "gallery.html").read_text()  # bundle too
+    # a single click plays/pauses (the expected player gesture); zoom is a
+    # deliberate double-click, so tapping the image never surprises the viewer
+    assert "dblclick" in demo and ".stage.zoomed" in demo
+    assert "single click -> play/pause" in demo
+    assert "dblclick" in (out / "gallery.html").read_text()  # bundle too
     # smarter TTS: prefer a natural voice + a voice picker, not the robotic default
     assert "_vscore" in demo and 'id="voice"' in demo and "u.rate=0.97" in demo
     # studio voiceover playback wiring (plays embedded audio when present)
@@ -1233,3 +1236,34 @@ def test_nl_flow_prompt_forbids_invented_and_fragile_locators():
     assert "clickable" in s
     assert "page.evaluate(window.scrollTo" in s or "window.scrollTo" in s
     assert "mouse.wheel" in s
+
+
+# ---- generated-code safety ---------------------------------------------------
+
+def test_normalize_flow_code_fixes_js_isms_in_python():
+    """A model asked for Python sometimes emits JS habits. Unfixed, the flow dies
+    with a SyntaxError that has nothing to do with the user's app."""
+    code = ('await page.goto(BASE + "/")\n'
+            '// TODO: tighten this\n'
+            'await expect(page).to_have_title(/Dylan Roy/i)')
+    out = specreel.normalize_flow_code(code, "py")
+    assert "# TODO: tighten this" in out and "//" not in out
+    assert 're.compile("Dylan Roy", re.I)' in out
+    compile("async def _f(page, BASE, expect, re):\n" +
+            "\n".join("    " + l for l in out.splitlines()), "<f>", "exec")
+
+
+def test_normalize_flow_code_discards_uncompilable_python():
+    assert specreel.normalize_flow_code("await page.click(", "py") == ""
+    assert specreel.normalize_flow_code("", "py") == ""
+
+
+def test_normalize_flow_code_leaves_js_alone_but_fixes_comments():
+    out = specreel.normalize_flow_code('# note\nawait page.click("a");', "js")
+    assert out.startswith("// note")
+
+
+def test_nl_prompt_covers_hidden_fields_and_unobservable_content():
+    s = specreel.NL_FLOW_SYSTEM
+    assert '"visible": false' in s and "opened_by" in s      # open the modal first
+    assert "do NOT invent class names" in s
