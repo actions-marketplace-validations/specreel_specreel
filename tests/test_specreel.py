@@ -1267,3 +1267,36 @@ def test_nl_prompt_covers_hidden_fields_and_unobservable_content():
     s = specreel.NL_FLOW_SYSTEM
     assert '"visible": false' in s and "opened_by" in s      # open the modal first
     assert "do NOT invent class names" in s
+
+
+# ---- crawl-quality fixes from the multi-site sweep ---------------------------
+
+def test_page_parser_ignores_svg_titles_and_text():
+    """SVG <title> is icon metadata, not page content — Stripe's page title came
+    out as '…Stripe logoStripe logoGuidesCard_32' before this."""
+    doc = ('<html><head><title>Pricing</title></head><body>'
+           '<a href="/x"><svg><title>Stripe logo</title></svg>Pricing</a>'
+           '<h1>Plans<svg><title>badge</title></svg></h1>'
+           '</body></html>')
+    p = specreel._PageParser(); p.feed(doc)
+    assert p.title.strip() == "Pricing"
+    assert p.headings == ["Plans"]
+    assert p.links[0]["text"] == "Pricing"          # no 'Stripe logo' bleed
+
+
+def test_page_labels_collapse_doubled_responsive_text():
+    pg = {"links": [{"text": "Sign inSign in"}, {"text": "Pricing"}], "buttons": []}
+    assert specreel.page_labels(pg) == ["Sign in", "Pricing"]
+
+
+def test_recommend_flows_drops_form_twin_of_a_search():
+    """A search box lives inside a <form>, so the same field surfaced as BOTH
+    'Fill the X form' and 'Search on X' (4 of 6 real sites tested)."""
+    pg = {"url": "http://x/", "title": "Wiki", "headings": ["Wiki"],
+          "forms": [{"action": "", "method": "get",
+                     "fields": [{"name": "q", "placeholder": "Search here",
+                                 "type": "search", "id": ""}]}],
+          "inputs": [{"name": "q", "placeholder": "Search here", "type": "search", "id": ""}],
+          "buttons": [], "links": []}
+    flows = specreel.recommend_flows([pg])
+    assert [f["type"] for f in flows] == ["search"]   # one flow, the better one

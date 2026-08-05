@@ -598,14 +598,36 @@ def build_narration_request(rendered, title, model, product=""):
     }
 
 
-def _anthropic_messages(body, api_key, timeout=60):
+def _anthropic_messages(body, api_key, timeout=60, retries=1):
+    """One POST to the Messages API, with a single retry on transient failures
+    (read timeout, connection reset, 429/5xx). A generation that dies on a blip
+    surfaces to the user as 'scenario failed to resolve' with no way to tell it
+    was just network weather — one retry removes most of that noise."""
+    import socket
+    import urllib.error
     import urllib.request
     req = urllib.request.Request(
         ANTHROPIC_URL, data=json.dumps(body).encode("utf-8"),
         headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION,
                  "content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 529) and attempt < retries:
+                last = e
+                import time as _t
+                _t.sleep(2 * (attempt + 1))
+                continue
+            raise
+        except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError) as e:
+            if attempt < retries:
+                last = e
+                continue
+            raise
+    raise last
 
 
 def parse_narrations(response):
@@ -1951,9 +1973,17 @@ class _PageParser(HTMLParser):
         self.forms = []
         self._form = None
         self.inputs = []
+        self._svg = 0            # inside <svg>: its <title>/text is icon metadata,
+                                 # not page content (Stripe's page title came out
+                                 # as "…Stripe logoStripe logoGuidesCard_32")
 
     def handle_starttag(self, tag, attrs):
         d = dict(attrs)
+        if tag == "svg":
+            self._svg += 1
+            return
+        if self._svg:
+            return
         if tag == "title":
             self._in_title = True
         elif tag in ("h1", "h2", "h3"):
@@ -1980,6 +2010,11 @@ class _PageParser(HTMLParser):
                 self._form["fields"].append(f)
 
     def handle_endtag(self, tag):
+        if tag == "svg":
+            self._svg = max(0, self._svg - 1)
+            return
+        if self._svg:
+            return
         if tag == "title":
             self._in_title = False
         elif tag in ("h1", "h2", "h3") and self._htag == tag:
@@ -2003,6 +2038,8 @@ class _PageParser(HTMLParser):
             self._form = None
 
     def handle_data(self, data):
+        if self._svg:
+            return
         if self._in_title:
             self.title += data
         if self._htag:
@@ -2094,11 +2131,16 @@ _BROWSER_EXTRACT = r"""() => {
   // opens it first — so record it, and what probably opens it.
   const vis = e => !!(e.offsetParent || e.getClientRects().length);
   const opener = i => {
-    const d = i.closest('[role=dialog],.modal,dialog,[aria-modal]');
-    const guess = [...document.querySelectorAll('button,[role=button],a[aria-label]')]
+    // guess by the FIELD's semantics, not by container: a hidden search box is
+    // almost always revealed by a control whose accessible name says "search"
+    const kw = ((i.placeholder||'')+' '+(i.name||'')+' '+(i.getAttribute('type')||'')).toLowerCase();
+    const want = /search/.test(kw) ? /search/i
+               : /subscribe|sign.?up/.test(kw) ? /subscribe|sign.?up/i
+               : /search|menu|open|toggle|show/i;
+    const cands = [...document.querySelectorAll('button,[role=button],a[aria-label]')]
       .map(b => b.getAttribute('aria-label') || (b.textContent || '').trim())
-      .filter(x => x && /search|menu|filter|open/i.test(x));
-    return (d && guess.length) ? guess[0] : '';
+      .filter(x => x && x.length < 40 && want.test(x));
+    return cands[0] || '';
   };
   const fieldOf = i => ({name: i.name || '', placeholder: i.placeholder || '', id: i.id || '',
     visible: vis(i), opened_by: vis(i) ? '' : opener(i),
@@ -2179,6 +2221,11 @@ def page_labels(pg, limit=14):
     for t in ([l.get("text", "") for l in pg.get("links", [])]
               + list(pg.get("buttons", []))):
         t = " ".join((t or "").split())[:60]
+        # responsive nav renders the label twice (desktop+mobile spans) and the
+        # texts concatenate: "Sign inSign in" -> "Sign in"
+        h = len(t) // 2
+        if h and t[:h] == t[h:]:
+            t = t[:h]
         if t and len(t) > 1 and t.lower() not in seen:
             seen.add(t.lower())
             out.append(t)
@@ -2212,14 +2259,23 @@ def recommend_flows(pages, limit=8):
             navs.append({"type": "nav", "score": 1, "url": pg["url"],
                          "title": f"Open {short}", "heading": head,
                          "page_title": short, "fields": [], "labels": labels})
+    def sig(fl):
+        return "|".join(f'{f.get("name", "")}:{f.get("placeholder", "")}'
+                        for f in fl["fields"])
+
+    # a search box lives inside a <form>, so the same field would surface twice —
+    # once as "Fill the X form" and once as "Search on X" (it did, on 4 of 6 real
+    # sites tested). The search variant is the better demo; drop the form twin.
+    search_sigs = {sig(s) for s in searches}
+    forms = [f for f in forms if sig(f) not in search_sigs]
+
     seen, out = set(), []
     for fl in forms + searches + navs:
         if fl["type"] in ("form", "search"):
             # the same widget (a footer newsletter form, a header search box) shows
             # up on every crawled page — dedupe by its field signature, not by URL,
             # so a site-wide widget yields ONE flow instead of one per page.
-            key = fl["type"] + "|" + "|".join(
-                f'{f.get("name", "")}:{f.get("placeholder", "")}' for f in fl["fields"])
+            key = fl["type"] + "|" + sig(fl)
         else:
             key = fl["url"] + fl["type"]
         if key in seen:
@@ -2532,7 +2588,7 @@ def normalize_flow_code(code, lang):
     return "\n".join(lines)
 
 
-def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, timeout=60,
+def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, timeout=150,
             var_names=None):
     """Turn a plain-English description into a runnable flow, grounded in the crawled
     pages. `var_names` are project variables the model should reference as {{NAME}}.
