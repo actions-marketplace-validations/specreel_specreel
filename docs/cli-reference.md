@@ -61,6 +61,11 @@ script. See [recommend](recommend.md).
 - `--browser` — render pages with Playwright first (for client-rendered SPAs).
 - `--wait MS` — render wait in `--browser` mode (default 1200).
 - `--cookie "k=v; ..."` — Cookie header for a **logged-in crawl** (static + browser).
+- `--login-url URL` — **sign in before crawling** (implies `--browser`), so discovery
+  sees the real app instead of its marketing shell. Credentials come from the
+  environment — `SPECREEL_LOGIN_USER` / `SPECREEL_LOGIN_PASSWORD` — never from
+  the command line, so they stay out of shell history and `ps`. Use a
+  **dedicated test account**: whatever it can see may end up in a shared demo.
 - `--header "K: V"` — extra request header (repeatable), e.g. an `Authorization` bearer.
 - `--lang py|js` — scaffold language (auto-detected from `package.json` otherwise).
 - `-o FILE` — scaffold path (default `specreel_flows.<lang>`).
@@ -84,6 +89,14 @@ they're left as a `TODO` stub. Powers Specreel Cloud's onboarding wizard.
 Reorder / rename / **drop** discovered flows by a plain-English instruction (e.g.
 "focus on checkout, drop the marketing pages"). AI, BYO-key; never invents flows.
 Prints the new flow list as JSON.
+
+## `loginsteps --url <login page>` — generate sign-in steps
+Render a login page, find the username/password fields, and print Playwright
+steps that fill them from `{{SPECREEL_USER}}` / `{{SPECREEL_PASSWORD}}`
+placeholders (never real values). Specreel Cloud calls this when you save a
+project sign-in and leave the steps blank. Exits non-zero — with a plain
+explanation — for a magic-link/passwordless page, which credentials can't
+automate.
 
 ## `doctor [path]` — preflight your traces
 Sanity-check a traces dir (or a single `trace.zip`) before rendering: are traces

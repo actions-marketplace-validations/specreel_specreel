@@ -1272,13 +1272,27 @@ def find_config(explicit, root):
 
 
 def trim_setup_steps(steps, setup_urls):
-    """Drop `goto` steps whose URL matches a configured setup pattern — e.g. an
-    auth-login redirect you don't want appearing as the opening frames of a demo."""
+    """Drop setup that shouldn't appear in the demo: a `goto` matching a setup
+    pattern AND the actions performed on that page.
+
+    Dropping only the goto isn't enough — a sign-in leaves "Type demo@acme.test
+    into the Email field" and "Click Log in" behind, which both bores the viewer
+    and puts the test account's address in a shareable artifact. Everything from
+    a matching goto up to the next navigation is setup, so it all goes.
+    """
     if not setup_urls:
         return steps
-    return [s for s in steps
-            if not (s["method"] == "goto"
-                    and any(pat in (s["params"].get("url") or "") for pat in setup_urls))]
+    out, skipping = [], False
+    for s in steps:
+        if s["method"] == "goto":
+            url = s["params"].get("url") or ""
+            skipping = any(pat in url for pat in setup_urls)
+            if skipping:
+                continue          # the setup navigation itself
+        elif skipping:
+            continue              # an action ON the setup page (a credential fill)
+        out.append(s)
+    return out
 
 
 def gather_build_context():
@@ -2160,7 +2174,42 @@ _BROWSER_EXTRACT = r"""() => {
 }"""
 
 
-def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None):
+def browser_login(page, login_url, user, password, wait_ms=1500):
+    """Sign in with a real browser before crawling, so discovery sees the
+    AUTHENTICATED app instead of its marketing shell. Best-effort: returns True
+    if it believes it logged in (the URL moved off the login page, or the
+    password field is gone). Never raises."""
+    try:
+        page.goto(login_url, wait_until="load", timeout=25000)
+        page.wait_for_timeout(600)
+        pw = page.locator("input[type=password]").first
+        pw.wait_for(state="visible", timeout=8000)
+        # the identifier field: the fillable text/email input before the password
+        ident = page.locator(
+            "input[type=email], input[type=text], input[name*=user i], "
+            "input[name*=email i], input[id*=user i], input[id*=email i]").first
+        try:
+            ident.fill(user, timeout=5000)
+        except Exception:
+            pass
+        pw.fill(password, timeout=5000)
+        try:
+            page.get_by_role("button", name=re.compile(
+                r"log ?in|sign ?in|continue|submit", re.I)).first.click(timeout=5000)
+        except Exception:
+            pw.press("Enter")
+        page.wait_for_load_state("load", timeout=20000)
+        page.wait_for_timeout(wait_ms)
+        moved = page.url.rstrip("/") != login_url.rstrip("/")
+        gone = page.locator("input[type=password]").count() == 0
+        return bool(moved or gone)
+    except Exception as e:
+        sys.stderr.write(f"  login: could not sign in ({type(e).__name__}) — "
+                         "crawling as an anonymous visitor\n")
+        return False
+
+
+def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None, login=None):
     """Render each page with Playwright before extracting, so client-rendered
     apps expose their real DOM. Needs Playwright installed; returns the same page
     dicts as crawl() so recommend_flows()/scaffold work unchanged. `headers` (e.g.
@@ -2181,6 +2230,11 @@ def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None):
             ctx.set_extra_http_headers(headers)
         page = ctx.new_page()
         try:
+            if login and login.get("url") and login.get("password"):
+                if browser_login(page, login["url"], login.get("user", ""),
+                                 login["password"], wait_ms=wait_ms):
+                    print("  login: signed in — crawling the authenticated app",
+                          file=sys.stderr)
             while queue and len(pages) < max_pages:
                 url = queue.pop(0)
                 key = url.split("#")[0].rstrip("/") or url
@@ -2208,6 +2262,72 @@ _FILLABLE = {"text", "email", "password", "search", "tel", "url", "number", "tex
 
 def _fillable(f):
     return f["type"] in _FILLABLE and (f["name"] or f["placeholder"] or f["id"])
+
+
+_USER_RE = re.compile(r"user|email|login|account|e-?mail", re.I)
+_PASS_RE = re.compile(r"pass|pwd", re.I)
+
+
+def find_login_fields(pg):
+    """Locate the username + password inputs on a rendered login page.
+
+    Returns {"user": field, "password": field, "submit": "Button name"} with any
+    part possibly missing. Password is identified by type=password (the reliable
+    signal); the username is the nearest text/email field that looks like an
+    identifier — or, failing that, any other fillable field on the form.
+    """
+    fields = list(pg.get("inputs") or [])
+    for fm in pg.get("forms") or []:
+        for f in fm.get("fields") or []:
+            if f not in fields:
+                fields.append(f)
+    pw = next((f for f in fields if f.get("type") == "password"), None)
+    if not pw:
+        pw = next((f for f in fields
+                   if _PASS_RE.search(f.get("name", "") + f.get("id", "")
+                                      + f.get("placeholder", ""))), None)
+    ident = next((f for f in fields
+                  if f is not pw and f.get("type") in ("text", "email", "search")
+                  and _USER_RE.search(f.get("name", "") + f.get("id", "")
+                                      + f.get("placeholder", ""))), None)
+    if not ident:
+        ident = next((f for f in fields if f is not pw and _fillable(f)), None)
+    submit = next((b for b in (pg.get("buttons") or [])
+                   if re.search(r"log ?in|sign ?in|continue|submit", b, re.I)), "")
+    return {"user": ident, "password": pw, "submit": submit}
+
+
+def login_prelude(login_url, pg, lang="py", ind=""):
+    """Generated login steps to run BEFORE a flow: open the login page, fill the
+    credentials from {{SPECREEL_USER}}/{{SPECREEL_PASSWORD}}, submit, settle.
+
+    Credentials are placeholders substituted at run time — they are never written
+    into a scaffold, a config file, or a repo. The demo trims these steps (the
+    login URL goes into setup_urls), so a viewer sees the app, not the sign-in.
+    """
+    got = find_login_fields(pg or {})
+    a = "await " if lang == "py" else "await "
+    q = json.dumps
+    out = [f"{ind}{a}page.goto({q(login_url)})"]
+    if got["user"]:
+        out.append(f"{ind}{a}{_locator_expr(got['user'], lang)}"
+                   f'.fill("{{{{SPECREEL_USER}}}}")')
+    if got["password"]:
+        out.append(f"{ind}{a}{_locator_expr(got['password'], lang)}"
+                   f'.fill("{{{{SPECREEL_PASSWORD}}}}")')
+    if not (got["user"] and got["password"]):
+        mark = "#" if lang == "py" else "//"
+        out.append(f"{ind}{mark} TODO: login fields not auto-detected — set them here")
+    if got["submit"]:
+        nm = q(got["submit"])
+        out.append(f'{ind}{a}page.get_by_role("button", name={nm}).first.click()'
+                   if lang == "py" else
+                   f'{ind}{a}page.getByRole("button", {{ name: {nm} }}).first().click()')
+    elif got["password"]:
+        out.append(f'{ind}{a}{_locator_expr(got["password"], lang)}.press("Enter")')
+    out.append(f'{ind}{a}page.wait_for_load_state("load")'
+               if lang == "py" else f'{ind}{a}page.waitForLoadState("load")')
+    return "\n".join(out)
 
 
 def page_labels(pg, limit=14):
@@ -2325,7 +2445,7 @@ def slugify_flow(title, used):
     return slug
 
 
-def scaffold_script(flows, base, lang="py"):
+def scaffold_script(flows, base, lang="py", login_steps=""):
     """Emit a runnable Playwright script that traces each flow into
     test-results/<slug>/trace.zip — exactly what `specreel <dir>` consumes."""
     used = set()
@@ -2346,11 +2466,17 @@ def scaffold_script(flows, base, lang="py"):
                 f"{ind}await page.waitForTimeout(700);"]
 
     def steps(fl, ind):
+        pre = ""
+        if login_steps:
+            # every flow starts from a fresh browser context, so the sign-in has
+            # to run per flow — not once at the top of the file
+            pre = "\n".join((ind + ln) if ln.strip() else ln
+                            for ln in str(login_steps).strip("\n").splitlines()) + "\n"
         if fl.get("code"):
             # an NL-authored flow: use its body verbatim (re-indented) + a settle
             lines = str(fl["code"]).strip("\n").splitlines() or ["pass"]
             body = [(ind + ln) if ln.strip() else ln for ln in lines]
-            return "\n".join(body + _settle(ind))
+            return pre + "\n".join(body + _settle(ind))
         out = []
         url = fl["url"]
         out.append(f'{ind}await page.goto({json.dumps(url)})')
@@ -2391,7 +2517,7 @@ def scaffold_script(flows, base, lang="py"):
         else:
             out.append(f'{ind}# TODO: click submit / assert the result you care about')
         out += _settle(ind)
-        return "\n".join(out)
+        return pre + "\n".join(out)
 
     if lang == "py":
         body = ["\"\"\"Auto-scaffolded by `specreel recommend`. Edit the TODOs, then:",
@@ -2646,7 +2772,8 @@ def assemble_scaffold(spec, api_key=None):
             resolved.append(fl)
         else:
             resolved.append(it)
-    return scaffold_script(resolved, base, lang=lang)
+    return scaffold_script(resolved, base, lang=lang,
+                           login_steps=spec.get("login_steps", ""))
 
 
 def scaffold_main(argv):
@@ -2773,6 +2900,13 @@ def recommend_main(argv):
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--cookie", default=None,
                     help="Cookie header for a logged-in crawl, e.g. 'session=abc; csrf=xyz'")
+    ap.add_argument("--login-url", default=None,
+                    help="sign in at this URL before crawling (implies --browser). "
+                         "Credentials come from SPECREEL_LOGIN_USER / "
+                         "SPECREEL_LOGIN_PASSWORD — never passed on the command line, "
+                         "so they stay out of your shell history and process list. "
+                         "Use a DEDICATED TEST ACCOUNT: whatever it can see may end "
+                         "up in a shared demo.")
     ap.add_argument("--header", action="append", default=[], metavar="K:V",
                     help="extra request header (repeatable), e.g. --header 'Authorization: Bearer …'")
     ap.add_argument("--json", action="store_true",
@@ -2799,9 +2933,20 @@ def recommend_main(argv):
         return 1
 
     lang = args.lang or ("js" if os.path.exists("package.json") else "py")
+    login = None
+    if args.login_url:
+        pw = os.environ.get("SPECREEL_LOGIN_PASSWORD", "")
+        if not pw:
+            return fail("--login-url needs SPECREEL_LOGIN_PASSWORD in the environment "
+                        "(and usually SPECREEL_LOGIN_USER)")
+        login = {"url": args.login_url, "user": os.environ.get("SPECREEL_LOGIN_USER", ""),
+                 "password": pw}
+        args.browser = True          # signing in requires a real browser
     mode = "browser-rendered" if args.browser else "server HTML"
-    say(f"  crawling {args.url} (max {args.max} pages, {mode}) ...")
-    pages = (crawl_browser(args.url, max_pages=args.max, wait_ms=args.wait, headers=headers)
+    say(f"  crawling {args.url} (max {args.max} pages, {mode}"
+        f"{', authenticated' if login else ''}) ...")
+    pages = (crawl_browser(args.url, max_pages=args.max, wait_ms=args.wait,
+                           headers=headers, login=login)
              if args.browser else crawl(args.url, max_pages=args.max, headers=headers))
     if not pages:
         return fail("no pages fetched — is the app running?" +
@@ -2961,7 +3106,38 @@ def init_main(argv):
     return init_config(args.traces, args.out)
 
 
+def loginsteps_main(argv):
+    """Emit generated sign-in steps for a login page (placeholders, no secrets).
+    The cloud calls this when a user saves a login and leaves the steps blank."""
+    ap = argparse.ArgumentParser(prog="specreel.py loginsteps",
+                                 description="generate Playwright sign-in steps for a login page")
+    ap.add_argument("--url", required=True, help="the login page URL")
+    ap.add_argument("--lang", default="py", choices=["py", "js"])
+    ap.add_argument("--wait", type=int, default=1500, help="render wait (ms)")
+    args = ap.parse_args(argv)
+    pages = crawl_browser(args.url, max_pages=1, wait_ms=args.wait)
+    if not pages:
+        sys.stderr.write("loginsteps: could not load the login page\n")
+        return 1
+    got = find_login_fields(pages[0])
+    if not got["password"]:
+        if got["user"]:
+            sys.stderr.write(
+                "loginsteps: this page asks for an identifier but no password — it "
+                "looks like a magic-link / passwordless sign-in, which a username "
+                "and password can't automate. Use a session cookie instead "
+                "(recommend --cookie), or point at a password login page.\n")
+        else:
+            sys.stderr.write("loginsteps: no sign-in fields found on that page — "
+                             "is that the login URL?\n")
+        return 1
+    print(login_prelude(args.url, pages[0], lang=args.lang))
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "loginsteps":
+        sys.exit(loginsteps_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "publish":
         sys.exit(publish_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "init":

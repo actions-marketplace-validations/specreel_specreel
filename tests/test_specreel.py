@@ -1300,3 +1300,65 @@ def test_recommend_flows_drops_form_twin_of_a_search():
           "buttons": [], "links": []}
     flows = specreel.recommend_flows([pg])
     assert [f["type"] for f in flows] == ["search"]   # one flow, the better one
+
+
+# ---- sign-in for apps behind a login ----------------------------------------
+
+def _login_page():
+    return {"url": "http://app/login", "title": "Log in", "headings": ["Log in"],
+            "inputs": [{"name": "email", "placeholder": "you@company.com",
+                        "type": "email", "id": ""},
+                       {"name": "password", "placeholder": "", "type": "password", "id": ""}],
+            "forms": [], "buttons": ["Log in"], "links": []}
+
+
+def test_find_login_fields_identifies_user_and_password():
+    got = specreel.find_login_fields(_login_page())
+    assert got["password"]["type"] == "password"
+    assert got["user"]["name"] == "email"
+    assert got["submit"] == "Log in"
+
+
+def test_login_prelude_uses_placeholders_never_secrets():
+    code = specreel.login_prelude("http://app/login", _login_page(), lang="py")
+    assert "{{SPECREEL_USER}}" in code and "{{SPECREEL_PASSWORD}}" in code
+    assert "page.goto(\"http://app/login\")" in code
+    assert 'name="Log in"' in code            # submits via the real button
+    # a generated prelude must be valid python
+    compile("async def _f(page):\n" + "\n".join("    " + l for l in code.splitlines()),
+            "<p>", "exec")
+
+
+def test_login_prelude_flags_undetectable_fields():
+    blank = {"inputs": [], "forms": [], "buttons": [], "links": []}
+    assert "TODO" in specreel.login_prelude("http://app/login", blank, lang="py")
+
+
+def test_trim_setup_steps_removes_credential_fills_not_just_the_goto():
+    """Dropping only the navigation left 'Type demo@acme.test into…' in the demo —
+    the test account's address in a shareable artifact."""
+    steps = [
+        {"method": "goto", "params": {"url": "http://app/login"}},
+        {"method": "fill", "params": {"value": "demo@acme.test", "selector": "x"}},
+        {"method": "fill", "params": {"value": "pw", "selector": "internal:attr=[type=password]"}},
+        {"method": "click", "params": {"selector": 'internal:role=button[name="Log in"i]'}},
+        {"method": "goto", "params": {"url": "http://app/dashboard"}},
+        {"method": "click", "params": {"selector": 'internal:role=link[name="Reports"i]'}},
+    ]
+    out = specreel.trim_setup_steps(steps, ["/login"])
+    assert [s["method"] for s in out] == ["goto", "click"]
+    assert all("demo@acme.test" not in str(s["params"]) for s in out)
+    # without a setup pattern nothing is dropped
+    assert len(specreel.trim_setup_steps(steps, [])) == 6
+
+
+def test_scaffold_script_prepends_login_to_every_flow():
+    """Each flow runs in a fresh context, so one login at the top of the file
+    would not carry — it has to repeat per flow."""
+    flows = [{"title": "A", "type": "nav", "url": "http://app/a", "heading": "",
+              "page_title": "", "fields": [], "labels": []},
+             {"title": "B", "type": "nav", "url": "http://app/b", "heading": "",
+              "page_title": "", "fields": [], "labels": []}]
+    script = specreel.scaffold_script(flows, "http://app", lang="py",
+                                      login_steps='await page.goto("http://app/login")')
+    assert script.count('await page.goto("http://app/login")') == 2
