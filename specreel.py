@@ -2174,6 +2174,11 @@ _BROWSER_EXTRACT = r"""() => {
 }"""
 
 
+class CrawlFailed(Exception):
+    """Every page failed to load — carries the first underlying reason so the
+    user sees what actually went wrong, not a generic empty result."""
+
+
 def browser_login(page, login_url, user, password, wait_ms=1500):
     """Sign in with a real browser before crawling, so discovery sees the
     AUTHENTICATED app instead of its marketing shell. Best-effort: returns True
@@ -2223,8 +2228,12 @@ def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None, login=None):
         return []
     host = urlparse(base).netloc
     seen, queue, pages = set(), [base], []
+    errors = []
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        # container-safe flags: the Chrome sandbox needs privileges a hardened
+        # container doesn't grant, and /dev/shm is tiny in most runtimes
+        browser = p.chromium.launch(args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
         ctx = browser.new_context(viewport={"width": 1280, "height": 900})
         if headers:
             ctx.set_extra_http_headers(headers)
@@ -2245,7 +2254,13 @@ def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None, login=None):
                     page.goto(url, wait_until="load", timeout=20000)
                     page.wait_for_timeout(wait_ms)      # let the SPA render
                     data = page.evaluate(_BROWSER_EXTRACT)
-                except Exception:
+                except Exception as e:
+                    # remember WHY. Swallowing this made a total failure look
+                    # identical to "the site has no pages", and the user got
+                    # "is the app running?" for a site that was plainly running.
+                    if not errors:
+                        errors.append(f"{url}: {type(e).__name__}: "
+                                      f"{str(e).splitlines()[0][:160]}")
                     continue
                 data["url"] = url
                 pages.append(data)
@@ -2254,6 +2269,10 @@ def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None, login=None):
                         queue.append(nxt)
         finally:
             browser.close()
+    if not pages and errors:
+        # surface the first real reason instead of an empty list
+        sys.stderr.write(f"  crawl: {errors[0]}\n")
+        raise CrawlFailed(errors[0])
     return pages
 
 
@@ -2996,9 +3015,12 @@ def recommend_main(argv):
     mode = "browser-rendered" if args.browser else "server HTML"
     say(f"  crawling {args.url} (max {args.max} pages, {mode}"
         f"{', authenticated' if login else ''}) ...")
-    pages = (crawl_browser(args.url, max_pages=args.max, wait_ms=args.wait,
-                           headers=headers, login=login)
-             if args.browser else crawl(args.url, max_pages=args.max, headers=headers))
+    try:
+        pages = (crawl_browser(args.url, max_pages=args.max, wait_ms=args.wait,
+                               headers=headers, login=login)
+                 if args.browser else crawl(args.url, max_pages=args.max, headers=headers))
+    except CrawlFailed as e:
+        return fail(f"couldn't load that URL — {e}")
     if not pages:
         return fail("no pages fetched — is the app running?" +
                     ("" if args.browser else " (a JS-rendered SPA? try --browser)"))

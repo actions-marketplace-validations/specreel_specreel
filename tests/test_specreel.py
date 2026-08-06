@@ -1410,3 +1410,11 @@ def test_login_prelude_flags_undetected_fields():
     code = specreel.login_prelude("https://app.test/login",
                                   {"inputs": [], "forms": [], "buttons": []}, "py")
     assert "TODO" in code
+
+
+def test_crawl_failed_carries_the_reason():
+    """A crawl where every page failed must say WHY. Swallowing it produced
+    'no pages fetched — is the app running?' for sites that were plainly up."""
+    assert issubclass(specreel.CrawlFailed, Exception)
+    e = specreel.CrawlFailed("https://x/: TimeoutError: Timeout 20000ms exceeded")
+    assert "Timeout" in str(e)
