@@ -2174,6 +2174,33 @@ _BROWSER_EXTRACT = r"""() => {
 }"""
 
 
+def _goto_settled(page, url, timeout=20000, wait_ms=1200):
+    """Navigate somewhere that may re-navigate itself.
+
+    SPAs routinely replace the URL on mount (auth checks, locale/router
+    redirects). If that lands while goto() is still pending, Playwright aborts
+    with "interrupted by another navigation" — a race, not a broken site, and it
+    made kumkuat.ai unscannable from Cloud Run while working locally. Treat it
+    as "the app took over" and wait for the page it settled on.
+
+    Waits for domcontentloaded rather than load: a slow third-party asset (fonts,
+    analytics) shouldn't fail a crawl, and wait_ms covers rendering anyway.
+    """
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    except Exception as e:
+        msg = str(e)
+        if "interrupted by another navigation" in msg or "navigation to" in msg.lower():
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=timeout)
+            except Exception:
+                pass                       # it may already be settled
+        else:
+            # one retry: transient DNS/TLS blips shouldn't sink a whole crawl
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    page.wait_for_timeout(wait_ms)         # let the SPA render
+
+
 class CrawlFailed(Exception):
     """Every page failed to load — carries the first underlying reason so the
     user sees what actually went wrong, not a generic empty result."""
@@ -2185,8 +2212,7 @@ def browser_login(page, login_url, user, password, wait_ms=1500):
     if it believes it logged in (the URL moved off the login page, or the
     password field is gone). Never raises."""
     try:
-        page.goto(login_url, wait_until="load", timeout=25000)
-        page.wait_for_timeout(600)
+        _goto_settled(page, login_url, timeout=25000, wait_ms=600)
         pw = page.locator("input[type=password]").first
         pw.wait_for(state="visible", timeout=8000)
         # the identifier field: the fillable text/email input before the password
@@ -2251,8 +2277,7 @@ def crawl_browser(base, max_pages=12, wait_ms=1200, headers=None, login=None):
                     continue
                 seen.add(key)
                 try:
-                    page.goto(url, wait_until="load", timeout=20000)
-                    page.wait_for_timeout(wait_ms)      # let the SPA render
+                    _goto_settled(page, url, wait_ms=wait_ms)
                     data = page.evaluate(_BROWSER_EXTRACT)
                 except Exception as e:
                     # remember WHY. Swallowing this made a total failure look

@@ -1418,3 +1418,37 @@ def test_crawl_failed_carries_the_reason():
     assert issubclass(specreel.CrawlFailed, Exception)
     e = specreel.CrawlFailed("https://x/: TimeoutError: Timeout 20000ms exceeded")
     assert "Timeout" in str(e)
+
+
+def test_goto_settled_tolerates_self_navigation():
+    """SPAs replace the URL on mount; if that lands mid-goto Playwright aborts
+    with 'interrupted by another navigation'. That's a race, not a broken site —
+    it made kumkuat.ai unscannable from Cloud Run while working locally."""
+    class FakePage:
+        def __init__(self, fail_times):
+            self.fail_times, self.gotos, self.waited = fail_times, 0, False
+        def goto(self, url, wait_until=None, timeout=None):
+            self.gotos += 1
+            if self.gotos <= self.fail_times:
+                raise RuntimeError('Page.goto: Navigation to "/" is interrupted '
+                                   'by another navigation to "/"')
+        def wait_for_load_state(self, state, timeout=None):
+            self.waited = True
+        def wait_for_timeout(self, ms):
+            pass
+
+    pg = FakePage(fail_times=1)
+    specreel._goto_settled(pg, "https://app.test/", wait_ms=0)
+    assert pg.waited and pg.gotos == 1          # settled, not blindly re-navigated
+
+    # an unrelated error retries once, then propagates
+    class Broken(FakePage):
+        def goto(self, url, wait_until=None, timeout=None):
+            self.gotos += 1
+            raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
+    b = Broken(0)
+    try:
+        specreel._goto_settled(b, "https://nope.test/", wait_ms=0)
+        assert False, "should have raised"
+    except RuntimeError as e:
+        assert "ERR_NAME_NOT_RESOLVED" in str(e) and b.gotos == 2
