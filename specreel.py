@@ -2330,6 +2330,57 @@ def login_prelude(login_url, pg, lang="py", ind=""):
     return "\n".join(out)
 
 
+_LOGIN_URL_RE = re.compile(r"/(login|signin|sign-in|auth|account/login|users/sign_in)\b", re.I)
+
+
+def detect_login_wall(pages):
+    """Does this site require signing in to see anything worth demoing?
+
+    Returns {"needed": bool, "login_url": str, "reason": str}. Called after a
+    crawl so onboarding can ask for credentials instead of handing back a
+    gallery of the marketing shell (or nothing at all).
+
+    Signals, strongest first: pages that landed on a login URL, a password field
+    on the page we were given, and a page whose only real control is a sign-in.
+    """
+    if not pages:
+        return {"needed": False, "login_url": "", "reason": ""}
+    login_pages = [p for p in pages if _LOGIN_URL_RE.search(p.get("url", ""))]
+    with_pw = [p for p in pages
+               if any(f.get("type") == "password"
+                      for f in (p.get("inputs") or []))
+               or any(f.get("type") == "password"
+                      for fm in (p.get("forms") or []) for f in fm.get("fields") or [])]
+    first = pages[0]
+    landed_on_login = bool(_LOGIN_URL_RE.search(first.get("url", "")))
+    url = ""
+    if with_pw:
+        url = with_pw[0].get("url", "")
+    elif login_pages:
+        url = login_pages[0].get("url", "")
+    else:
+        # no password field crawled, but a prominent "Log in" link is a hint of
+        # a gated app — only report it when there's little else to demo
+        for p in pages:
+            for l in p.get("links") or []:
+                if re.fullmatch(r"\s*(log ?in|sign ?in)\s*", l.get("text", ""), re.I):
+                    url = l.get("href", "")
+                    break
+            if url:
+                break
+    if landed_on_login and with_pw:
+        return {"needed": True, "login_url": first.get("url", ""),
+                "reason": "that URL is a sign-in page"}
+    if with_pw and len(pages) <= 2:
+        return {"needed": True, "login_url": url,
+                "reason": "the pages we could reach are behind a sign-in"}
+    if with_pw:
+        return {"needed": False, "login_url": url,
+                "reason": "a sign-in page was found — adding credentials would let "
+                          "Specreel demo the logged-in app too"}
+    return {"needed": False, "login_url": url, "reason": ""}
+
+
 def page_labels(pg, limit=14):
     """The clickable things that ACTUALLY exist on a page — link and button text.
 
@@ -2985,6 +3036,8 @@ def recommend_main(argv):
                        "labels": fl.get("labels", []),
                        "n_fields": len(fl.get("fields", []))} for fl in flows],
             "scaffold": scaffold,
+            # does this app need credentials to show anything worth demoing?
+            "login": detect_login_wall(pages),
         }))
         return 0
 

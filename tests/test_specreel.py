@@ -1362,3 +1362,51 @@ def test_scaffold_script_prepends_login_to_every_flow():
     script = specreel.scaffold_script(flows, "http://app", lang="py",
                                       login_steps='await page.goto("http://app/login")')
     assert script.count('await page.goto("http://app/login")') == 2
+
+
+# ---- login-wall detection ----------------------------------------------------
+
+def _pg(url, inputs=(), links=()):
+    return {"url": url, "title": "T", "headings": ["H"], "forms": [],
+            "inputs": list(inputs), "buttons": [], "links": list(links)}
+
+
+def test_detect_login_wall_on_a_sign_in_page():
+    pages = [_pg("https://app.test/login",
+                 inputs=[{"name": "email", "placeholder": "", "type": "email", "id": ""},
+                         {"name": "pw", "placeholder": "", "type": "password", "id": ""}])]
+    got = specreel.detect_login_wall(pages)
+    assert got["needed"] is True and got["login_url"].endswith("/login")
+
+
+def test_detect_login_wall_quiet_on_an_open_site():
+    pages = [_pg("https://blog.test/", links=[{"text": "Archive", "href": "/a"}]),
+             _pg("https://blog.test/a", links=[])]
+    assert specreel.detect_login_wall(pages)["needed"] is False
+
+
+def test_detect_login_wall_suggests_credentials_without_demanding_them():
+    """A public site that merely HAS a login page shouldn't block onboarding —
+    it should just mention that credentials would unlock more."""
+    pages = [_pg("https://shop.test/", links=[{"text": "Log in", "href": "/login"}]),
+             _pg("https://shop.test/products"),
+             _pg("https://shop.test/login",
+                 inputs=[{"name": "pw", "placeholder": "", "type": "password", "id": ""}])]
+    got = specreel.detect_login_wall(pages)
+    assert got["needed"] is False and "credentials" in got["reason"]
+
+
+def test_login_prelude_uses_placeholders_not_literals():
+    pg = {"inputs": [{"name": "email", "placeholder": "Email", "type": "email", "id": ""},
+                     {"name": "password", "placeholder": "", "type": "password", "id": ""}],
+          "forms": [], "buttons": ["Log in"]}
+    code = specreel.login_prelude("https://app.test/login", pg, "py")
+    assert "{{SPECREEL_USER}}" in code and "{{SPECREEL_PASSWORD}}" in code
+    assert "hunter2" not in code                      # never a literal credential
+    assert 'name="Log in"' in code and "wait_for_load_state" in code
+
+
+def test_login_prelude_flags_undetected_fields():
+    code = specreel.login_prelude("https://app.test/login",
+                                  {"inputs": [], "forms": [], "buttons": []}, "py")
+    assert "TODO" in code
