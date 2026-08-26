@@ -184,14 +184,48 @@ def test_secret_masking_conservative():
 def test_plumbing_methods_skipped():
     # internal waits / setup calls must not surface as demo steps
     assert "waitForTimeout" in specreel.SKIP_METHODS
+    assert "__waitInfo__" in specreel.SKIP_METHODS
+    assert "scrollIntoViewIfNeeded" in specreel.SKIP_METHODS
+    assert "innerText" in specreel.SKIP_METHODS
+    assert "evaluate" in specreel.SKIP_METHODS
+    assert "evaluateExpression" in specreel.SKIP_METHODS
     events = [
         {"type": "before", "callId": "1", "method": "click", "params": {}, "startTime": 1},
         {"type": "after", "callId": "1", "endTime": 2},
         {"type": "before", "callId": "2", "method": "waitForTimeout", "params": {}, "startTime": 3},
         {"type": "after", "callId": "2", "endTime": 4},
+        # Playwright ≥1.53 wait instrumentation (was waitForEventInfo)
+        {"type": "before", "callId": "3", "method": "__waitInfo__", "params": {}, "startTime": 5},
+        {"type": "after", "callId": "3", "endTime": 6},
+        {"type": "before", "callId": "4", "method": "__abort__", "params": {}, "startTime": 7},
+        {"type": "after", "callId": "4", "endTime": 8},
     ]
     steps, _ = specreel.build_steps(events)
     assert [s["method"] for s in steps] == ["click"]
+    # humanize must never be asked to title a protocol method (fallback = raw name)
+    assert specreel.humanize({"method": "__waitInfo__", "params": {}})[0] == "__waitInfo__"
+
+
+def test_outcome_waits_are_demo_steps():
+    """URL/function waits are outcomes (chat reply, scorecard results) — not plumbing."""
+    assert "waitForFunction" not in specreel.SKIP_METHODS
+    assert "waitForURL" not in specreel.SKIP_METHODS
+    events = [
+        {"type": "before", "callId": "1", "method": "press", "params": {"key": "Enter"},
+         "startTime": 1},
+        {"type": "after", "callId": "1", "endTime": 2},
+        {"type": "before", "callId": "2", "method": "waitForFunction",
+         "params": {"expression": "document.body.innerText.length > 1100"},
+         "startTime": 3},
+        {"type": "after", "callId": "2", "endTime": 8000},
+        {"type": "before", "callId": "3", "method": "waitForURL",
+         "params": {"url": "persona-reaction"}, "startTime": 9000},
+        {"type": "after", "callId": "3", "endTime": 12000},
+    ]
+    steps, _ = specreel.build_steps(events)
+    assert [s["method"] for s in steps] == ["press", "waitForFunction", "waitForURL"]
+    assert specreel.humanize(steps[1])[0] == "Wait for the response"
+    assert specreel.humanize(steps[2])[0] == "Wait for the results"
 
 
 def test_humanize_kinds():
@@ -248,31 +282,148 @@ def test_gallery_filter_and_player_zoom(tmp_path):
     assert "dblclick" in (out / "gallery.html").read_text()  # bundle too
     # smarter TTS: prefer a natural voice + a voice picker, not the robotic default
     assert "_vscore" in demo and 'id="voice"' in demo and "u.rate=0.97" in demo
+    # autoplay must wait for TTS to finish (not just step.dur ~1.4s)
+    assert "u.onend=" in demo and "_speakMs" in demo and "_gen" in demo
     # studio voiceover playback wiring (plays embedded audio when present)
     assert "function playStep" in demo and "new Audio()" in demo
+    # the narration engine is ONE shared snippet — both players get identical wiring
+    gal = (out / "gallery.html").read_text()
+    for page in (demo, gal):
+        assert "_initTTS" in page and "_hasVO" in page   # studio VO defaults sound ON
+        assert "🔊 Voiceover" in page                     # paid narration labels itself
+        assert "specreel-tts" in page and "specreel-voice" in page  # prefs persist
+        assert "This step failed: " in page               # failures are audible
+        assert "the hidden value" in page                 # masked ••• never read aloud
 
 
 def test_synthesize_voiceover(monkeypatch):
+    monkeypatch.setenv("SPECREEL_TTS_CACHE", "off")
     calls = []
     monkeypatch.setattr(specreel, "_openai_tts",
-                        lambda text, key, voice, model, fmt="mp3", timeout=30:
-                        (calls.append((text, voice, model)), b"MP3BYTES")[1])
+                        lambda text, key, voice, model, fmt="mp3", timeout=30,
+                        instructions="":
+                        (calls.append((text, voice, model, instructions)), b"MP3BYTES")[1])
     rendered = [
         {"caption": "Open /x", "kind": "nav", "img": "", "dur": 1.2, "failed": False},
         {"narration": "Sign up now", "caption": "Type", "kind": "action", "img": "", "dur": 1.2, "failed": False}]
     n = specreel.synthesize_voiceover(rendered, "key", voice="nova", model="tts-1")
     assert n == 2 and rendered[0]["audio"].startswith("data:audio/mpeg;base64,")
-    assert calls[1][0] == "Sign up now"                  # narration preferred over caption
-    assert calls[0][1] == "nova" and calls[0][2] == "tts-1"
+    texts = {c[0] for c in calls}                        # synthesis is parallel: no order
+    assert "Sign up now" in texts                        # narration preferred over caption
+    assert all(c[1] == "nova" and c[2] == "tts-1" for c in calls)
+    assert all(c[3] == "" for c in calls)                # tts-1 rejects instructions
     assert specreel.step_payload(rendered)[0]["audio"]   # flows to the player payload
+    # gpt- models take delivery notes: the default narrator unless overridden
+    calls.clear()
+    r_gpt = [{"caption": "x", "kind": "nav", "img": "", "dur": 1, "failed": False}]
+    specreel.synthesize_voiceover(r_gpt, "key", model="gpt-4o-mini-tts")
+    assert calls[0][3] == specreel.DEFAULT_TTS_INSTRUCTIONS
+    calls.clear()
+    specreel.synthesize_voiceover(r_gpt, "key", model="gpt-4o-mini-tts",
+                                  instructions="brisk")
+    assert calls[0][3] == "brisk"
     # no key -> no calls, no audio
     r2 = [{"caption": "x", "kind": "nav", "img": "", "dur": 1, "failed": False}]
     assert specreel.synthesize_voiceover(r2, "") == 0 and not r2[0].get("audio")
-    # a per-step failure is graceful (no audio, no raise) -> falls back to browser voice
-    monkeypatch.setattr(specreel, "_openai_tts",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    # a per-step failure is graceful (no audio, no raise) -> falls back to browser
+    # voice, and the one retry actually happened
+    monkeypatch.setattr(specreel, "_TTS_RETRY_SLEEP", 0)
+    tries = []
+    def boom(*a, **k):
+        tries.append(1)
+        raise RuntimeError("boom")
+    monkeypatch.setattr(specreel, "_openai_tts", boom)
     r3 = [{"caption": "x", "kind": "nav", "img": "", "dur": 1, "failed": False}]
     assert specreel.synthesize_voiceover(r3, "key") == 0 and not r3[0].get("audio")
+    assert len(tries) == 2
+    # a transient blip recovers on the retry
+    flaky = {"n": 0}
+    def flip(*a, **k):
+        flaky["n"] += 1
+        if flaky["n"] == 1:
+            raise RuntimeError("blip")
+        return b"OK"
+    monkeypatch.setattr(specreel, "_openai_tts", flip)
+    r4 = [{"caption": "x", "kind": "nav", "img": "", "dur": 1, "failed": False}]
+    assert specreel.synthesize_voiceover(r4, "key") == 1
+
+
+def test_voiceover_tts_cache(tmp_path, monkeypatch):
+    import base64
+    monkeypatch.setenv("SPECREEL_TTS_CACHE", str(tmp_path / "tts"))
+    calls = []
+    monkeypatch.setattr(specreel, "_openai_tts",
+                        lambda text, *a, **k: (calls.append(text), b"AUDIO")[1])
+    step = lambda: [{"caption": "Open /x", "kind": "nav", "img": "", "dur": 1,
+                     "failed": False}]
+    assert specreel.synthesize_voiceover(step(), "key") == 1
+    assert len(calls) == 1 and len(list((tmp_path / "tts").iterdir())) == 1
+    # same words, same voice -> served from disk: a rebuild doesn't re-bill
+    r = step()
+    assert specreel.synthesize_voiceover(r, "key") == 1
+    assert len(calls) == 1
+    assert r[0]["audio"].endswith(base64.b64encode(b"AUDIO").decode())
+    # a different voice is a different clip
+    assert specreel.synthesize_voiceover(step(), "key", voice="onyx") == 1
+    assert len(calls) == 2
+    # cache disabled -> always synthesizes
+    monkeypatch.setenv("SPECREEL_TTS_CACHE", "off")
+    assert specreel.tts_cache_dir() is None
+    assert specreel.synthesize_voiceover(step(), "key") == 1
+    assert len(calls) == 3
+
+
+def test_speakable():
+    assert specreel.speakable({"caption": "Click Save", "failed": False}) == "Click Save"
+    assert specreel.speakable({"narration": "Save it", "caption": "Click",
+                               "failed": False}) == "Save it"
+    # masked secrets are never read as "bullet bullet bullet"
+    s = specreel.speakable({"caption": 'Enter ••• in "Password"', "failed": False})
+    assert "•" not in s and "the hidden value" in s
+    # url schemes are noise to the ear
+    assert specreel.speakable({"caption": "Open https://app.example.com/login",
+                               "failed": False}) == "Open app.example.com/login"
+    # a listener can't see the red caption bar — failures say so, with the reason
+    s = specreel.speakable({"caption": "Confirm the count reads 2",
+                            "failed": True, "why": "it read 3"})
+    assert s.startswith("This step failed: ") and s.endswith(". it read 3")
+    assert specreel.speakable({"caption": "", "failed": True}) == ""
+
+
+def test_plan_voiceover_timeline():
+    # no clips -> pure silence, nothing extended
+    ext, seg = specreel.plan_voiceover([1.0, 2.0], [None, None], lead=2.0, tail=2.6)
+    assert ext == [0.0, 0.0]
+    assert seg == [("silence", 2.0), ("silence", 1.0), ("silence", 2.0),
+                   ("silence", 2.6)]
+    # a clip that outruns its step extends the step's hold, never cut mid-sentence
+    ext, seg = specreel.plan_voiceover([1.0, 2.0], [3.0, 1.0],
+                                       lead=2.0, tail=2.6, breath=0.35)
+    assert ext == [2.35, 0.0]
+    assert seg[1] == ("clip", 0, 3.35) and seg[2] == ("clip", 1, 2.0)
+    # the audio track covers lead + every (extended) step + tail exactly
+    assert abs(sum(s[-1] for s in seg) - (2.0 + 3.35 + 2.0 + 2.6)) < 1e-6
+
+
+def test_caption_frames_spans(tmp_path):
+    Image = pytest.importorskip("PIL.Image")
+    import base64, io
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 40), (10, 10, 10)).save(buf, "JPEG")
+    img = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    rendered = [
+        {"i": 1, "caption": "a", "kind": "nav", "img": img, "imgs": [img, img],
+         "dts": [0, 500], "dur": 2.0, "failed": False},
+        {"i": 2, "caption": "b", "kind": "check", "img": "", "imgs": [], "dts": [],
+         "dur": 1.2, "failed": False},                # frameless step -> no span
+        {"i": 3, "caption": "c", "kind": "action", "img": img, "imgs": [],
+         "dts": [], "dur": 1.5, "failed": False}]
+    items, spans = specreel._caption_frames(rendered, str(tmp_path), W=64)
+    assert len(items) == 3                            # 2 clip frames + 1 still
+    assert [(a, b) for _, a, b in spans] == [(0, 1), (2, 2)]
+    assert spans[0][0] is rendered[0] and spans[1][0] is rendered[2]
+    # per-step screen time is what the audio planner sees: clip gap + final hold
+    assert abs(sum(d for _, d in items[0:2]) - 2.0) < 1e-6
 
 
 def test_build_bundle_is_single_self_contained_file(tmp_path):
@@ -461,11 +612,15 @@ def test_scaffold_quality_contract():
     assert 'to_have_title(re.compile("Dylan\\\\ Roy", re.I))' in py or "to_have_title" in py
     assert "Easily Make Youtube" not in py
     # search presses Enter and then settles so results are captured
-    assert '.press("Enter")' in py and "networkidle" in py and "wait_for_timeout(700)" in py
+    # Prefer load+pause over networkidle: chat/websocket apps never go idle,
+    # and a timed-out settle still lands as a FAIL step in the demo trace.
+    assert '.press("Enter")' in py
+    assert 'wait_for_load_state("load")' in py and "wait_for_timeout(1200)" in py
+    assert "networkidle" not in py
     # nav flows scroll (demo shows the page) instead of a dangling submit-TODO
     assert "page.mouse.wheel(0, 600)" in py
     js = specreel.scaffold_script([dict(f) for f in flows], "http://x", lang="js")
-    assert "toHaveTitle" in js and "waitForLoadState" in js
+    assert "toHaveTitle" in js and "waitForLoadState('load')" in js
     # form titles no longer claim a submit that doesn't happen
     pg = specreel.extract_page(SAMPLE_HTML, "http://app/signup")
     titles = [f["title"] for f in specreel.recommend_flows([pg])]
@@ -918,6 +1073,98 @@ def test_gallery_honors_config(tmp_path):
     assert manifest["flows"][0]["public"] is True
 
 
+def _showcase_entry(slug, public, failed):
+    return {"slug": slug, "title": slug.replace("-", " ").title(), "public": public,
+            "failed": failed, "duration": 12.0, "n_steps": 3, "n_actions": 2,
+            "n_checks": 1, "thumb": ""}
+
+
+def _fake_flow_dirs(out, slugs):
+    for slug in slugs:
+        d = out / slug
+        d.mkdir(parents=True)
+        (d / "demo.html").write_text(f"<h1>{slug}</h1>")
+
+
+def test_showcase_curates_public_passing(tmp_path):
+    out = tmp_path / "site"
+    _fake_flow_dirs(out, ["pub-ok", "pub-fail", "internal"])
+    entries = [_showcase_entry("pub-ok", public=True, failed=False),
+               _showcase_entry("pub-fail", public=True, failed=True),
+               _showcase_entry("internal", public=False, failed=False)]
+    path = specreel.build_showcase(entries, str(out), ctx={"build": "#7"},
+                                   cfg={"product_name": "Acme"})
+    body = open(path, encoding="utf-8").read()
+    # only the passing public flow's files ship — absence, not hiding
+    assert (out / "showcase" / "pub-ok" / "demo.html").exists()
+    assert not (out / "showcase" / "pub-fail").exists()
+    assert not (out / "showcase" / "internal").exists()
+    assert "Pub Ok" in body
+    assert "Pub Fail" not in body and "Internal" not in body
+    assert "failing" not in body.lower()          # no test jargon on the page
+    assert "build #7" in body and "verified" in body   # provenance kept
+    assert "Acme" in body
+    man = json.loads((out / "showcase" / "manifest.json").read_text())
+    assert [f["slug"] for f in man["flows"]] == ["pub-ok"]
+    assert "failed" not in man["flows"][0]        # curated manifest: no health fields
+
+
+def test_showcase_skipped_without_includable_flows(tmp_path):
+    out = tmp_path / "site"
+    _fake_flow_dirs(out, ["a"])
+    # a stale showcase/ from a previous build must be removed either way
+    (out / "showcase").mkdir()
+    (out / "showcase" / "index.html").write_text("stale")
+    # nothing marked public
+    assert specreel.build_showcase(
+        [_showcase_entry("a", public=False, failed=False)], str(out)) is None
+    assert not (out / "showcase").exists()
+    # public flows exist but every one is failing
+    (out / "showcase").mkdir()
+    assert specreel.build_showcase(
+        [_showcase_entry("a", public=True, failed=True)], str(out)) is None
+    assert not (out / "showcase").exists()
+
+
+def test_gallery_showcase_end_to_end(tmp_path):
+    import shutil as _sh
+    src = tmp_path / "traces"
+    for name in ("signup", "admin"):
+        d = src / name
+        d.mkdir(parents=True)
+        _sh.copy(FIXTURE, d / "trace.zip")
+    cfg = tmp_path / "specreel.yml"
+    cfg.write_text(
+        "title: Acme flows\n"
+        "product_name: Acme\n"
+        "showcase: true\n"
+        "showcase_accent: \"#7c5cff\"\n"
+        "flows:\n"
+        "  signup:\n"
+        "    public: true\n"
+    )
+    out = tmp_path / "site"
+    assert specreel.generate_gallery(str(src), str(out), config_path=str(cfg)) == 0
+    body = (out / "showcase" / "index.html").read_text()
+    assert (out / "showcase" / "signup" / "demo.html").exists()
+    assert not (out / "showcase" / "admin").exists()
+    assert "admin" not in body
+    assert "--green:#7c5cff" in body              # accent override applied
+    # the internal gallery is untouched: both flows, plus the manifest flag
+    assert (out / "admin" / "demo.html").exists()
+    man = json.loads((out / "manifest.json").read_text())
+    assert man["showcase"] is True
+
+
+def test_accent_css():
+    assert specreel._accent_css("") == ""
+    hexcss = specreel._accent_css("#7c5cff")
+    assert "--green:#7c5cff" in hexcss and "--green-dim:rgba(124,92,255,.09)" in hexcss
+    assert "@keyframes pulse" in hexcss           # glow re-tinted too
+    named = specreel._accent_css("rebeccapurple")
+    assert named == ":root{--green:rebeccapurple}"
+
+
 def test_build_context_shape():
     ctx = specreel.gather_build_context()
     assert set(ctx) == {"repo", "branch", "build"}   # all keys present, may be empty
@@ -1202,9 +1449,50 @@ def test_page_labels_dedupes_and_caps():
     pg = {"links": [{"text": "Home"}, {"text": "home"}, {"text": ""}, {"text": "Docs"}],
           "buttons": ["Search"]}
     labels = specreel.page_labels(pg)
-    assert labels == ["Home", "Docs", "Search"]     # case-insensitive dedupe, no blanks
+    # buttons first (page CTAs), then links — nav used to crowd out "From library"
+    assert labels == ["Search", "Home", "Docs"]     # case-insensitive dedupe, no blanks
     many = {"links": [{"text": f"L{i}"} for i in range(40)], "buttons": []}
     assert len(specreel.page_labels(many, limit=5)) == 5
+
+
+def test_page_labels_prefer_buttons_over_nav_links():
+    pg = {"buttons": ["From library", "Run scorecard"],
+          "links": [{"text": f"Nav{i}", "href": f"/{i}"} for i in range(30)]}
+    labels = specreel.page_labels(pg, limit=10)
+    assert labels[0] == "From library" and "Run scorecard" in labels
+
+
+def test_lint_flow_against_context_catches_invented_controls():
+    ctx = [{"url": "https://x/simulations",
+            "labels": ["From library", "Add all", "Run scorecard"],
+            "buttons": ["From library", "Add all", "Run scorecard"],
+            "roles": {"checkbox": 0, "option": 0},
+            "fields": [{"placeholder": "Search recent documents…"}]}]
+    bad = ('await page.get_by_role("checkbox").nth(0).check()\n'
+           'await page.get_by_role("button", name="Select from library").first.click()\n')
+    issues = specreel.lint_flow_against_context(bad, ctx)
+    assert any("checkbox" in i for i in issues)
+    assert any("Select from library" in i for i in issues)
+    good = ('await page.get_by_role("button", name="Add all").first.click()\n'
+            'await page.get_by_role("button", name="From library").first.click()\n')
+    assert specreel.lint_flow_against_context(good, ctx) == []
+
+
+def test_strip_embedded_login_and_ensure_first():
+    """NL sometimes re-emits sign-in (already handled by login_prelude) and omits
+    .first — both caused the latest Kumkuat failures."""
+    nested = (
+        'await page.goto(BASE + "/login")\n'
+        'await page.get_by_placeholder("Enter your email").fill("{{EMAIL}}")\n'
+        'await page.get_by_role("button", name="Sign In Signing in...").click()\n'
+        'await page.goto(BASE + "/simulations")\n'
+        'await page.get_by_role("button", name="Add all").nth(0).click()\n'
+    )
+    out = specreel.normalize_flow_code(nested, "py")
+    assert out.startswith('await page.goto(BASE + "/simulations")')
+    assert "/login" not in out
+    bare = 'await page.get_by_role("button", name="Pick an Audience").click()'
+    assert ".first.click()" in specreel.ensure_locator_first(bare)
 
 
 def test_recommend_flows_carry_real_clickable_labels():
@@ -1236,6 +1524,26 @@ def test_nl_flow_prompt_forbids_invented_and_fragile_locators():
     assert "clickable" in s
     assert "page.evaluate(window.scrollTo" in s or "window.scrollTo" in s
     assert "mouse.wheel" in s
+    assert "NEVER invent URL paths" in s
+    assert "known_pages is empty" in s
+    assert "roles.checkbox" in s
+    assert "From library" in s
+
+
+def test_context_from_recommend_and_merge():
+    from cloud import onboard
+    raw = {"flows": [
+        {"title": "Audiences", "url": "https://app.test/audiences/overview",
+         "type": "nav", "labels": ["Pin Audiences"], "fields": []},
+        {"title": "bad", "url": "", "labels": [], "fields": []},   # dropped
+    ]}
+    ctx = onboard.context_from_recommend(raw)
+    assert len(ctx) == 1 and ctx[0]["labels"] == ["Pin Audiences"]
+    assert onboard.context_from_recommend({"error": "x", "flows": []}) == []
+    merged = onboard.merge_flow_context(
+        [{"title": "A", "url": "/a"}],
+        [{"title": "A", "url": "/a"}, {"title": "B", "url": "/b"}])
+    assert [m["title"] for m in merged] == ["A", "B"]
 
 
 # ---- generated-code safety ---------------------------------------------------
@@ -1324,9 +1632,20 @@ def test_login_prelude_uses_placeholders_never_secrets():
     assert "{{SPECREEL_USER}}" in code and "{{SPECREEL_PASSWORD}}" in code
     assert "page.goto(\"http://app/login\")" in code
     assert 'name="Log in"' in code            # submits via the real button
+    assert "wait_for_url" in code             # SPA auth settle (not just load)
     # a generated prelude must be valid python
-    compile("async def _f(page):\n" + "\n".join("    " + l for l in code.splitlines()),
+    compile("import re\nasync def _f(page):\n" + "\n".join("    " + l for l in code.splitlines()),
             "<p>", "exec")
+
+
+def test_ensure_login_settle_appends_when_missing():
+    weak = ('await page.goto("https://app/login")\n'
+            'await page.get_by_role("button", name="Sign In").click()\n'
+            'await page.wait_for_load_state("load")')
+    hard = specreel.ensure_login_settle(weak)
+    assert "wait_for_url" in hard and weak in hard
+    # idempotent
+    assert specreel.ensure_login_settle(hard) == hard
 
 
 def test_login_prelude_flags_undetectable_fields():
@@ -1350,6 +1669,18 @@ def test_trim_setup_steps_removes_credential_fills_not_just_the_goto():
     assert all("demo@acme.test" not in str(s["params"]) for s in out)
     # without a setup pattern nothing is dropped
     assert len(specreel.trim_setup_steps(steps, [])) == 6
+
+
+def test_empty_after_setup_trim_is_failed(tmp_path):
+    """Hosted runs put the login URL in setup_urls. If the flow dies on sign-in,
+    every recorded step is trimmed away — that must not ship as a green empty
+    'ok' demo (the Kumkuat gallery false-success)."""
+    out = tmp_path / "demo"
+    stats = specreel.generate_demo(
+        FIXTURE, str(out), title="Trimmed", verbose=False,
+        setup_urls=["https://demo.playwright.dev/todomvc/"])
+    assert stats["n_steps"] == 0
+    assert stats["failed"] is True
 
 
 def test_scaffold_script_prepends_login_to_every_flow():
@@ -1403,7 +1734,7 @@ def test_login_prelude_uses_placeholders_not_literals():
     code = specreel.login_prelude("https://app.test/login", pg, "py")
     assert "{{SPECREEL_USER}}" in code and "{{SPECREEL_PASSWORD}}" in code
     assert "hunter2" not in code                      # never a literal credential
-    assert 'name="Log in"' in code and "wait_for_load_state" in code
+    assert 'name="Log in"' in code and "wait_for_url" in code
 
 
 def test_login_prelude_flags_undetected_fields():

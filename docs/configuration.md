@@ -13,6 +13,14 @@ ai: false                           # true (+ ANTHROPIC_API_KEY) to narrate capt
 ai_model: claude-opus-4-8           # model for narration (haiku-4-5 is cheaper)
 bundle: false                       # true to also emit the single-file gallery.html
 
+showcase: false                     # true to also emit showcase/ — the curated,
+                                    # customer-facing gallery (public & passing flows only)
+showcase_title: Acme in action      # showcase headline (default "<product_name> in action")
+showcase_tagline: See the product do the work.   # sub-line under the headline
+showcase_accent: "#7c5cff"          # accent color (hex also re-tints the glows)
+showcase_logo: assets/logo.svg      # logo file, embedded into the page (svg/png/jpg/webp)
+showcase_css: showcase.css          # raw CSS appended to the page — full styling control
+
 public_url: https://acme.github.io/app/   # used in notifications / links
 notify_webhook: https://hooks.slack.com/…  # Slack incoming webhook (or --notify)
 analytics: '<script defer data-domain="x" src="https://plausible.io/js/script.js"></script>'
@@ -42,7 +50,16 @@ flows:                              # keyed by flow slug (matches the gallery ou
 | `theme` | `dark` \| `light` | Color theme. CLI `--theme` overrides. |
 | `ai` | bool | Enable AI narration (still needs a key). CLI `--ai` also enables. |
 | `ai_model` | string | Narration model. |
+| `voice` | string | Studio voiceover voice (e.g. `nova`) — enables pre-rendered TTS narration (BYO `OPENAI_API_KEY`). CLI `--voice` also enables. |
+| `tts_model` | string | TTS model for `voice` (default `gpt-4o-mini-tts`). |
+| `tts_instructions` | string | Delivery notes for the narrator (`gpt-`* TTS models only). |
 | `bundle` | bool | Also emit `gallery.html`. CLI `--bundle` also enables. |
+| `showcase` | bool | Also emit `showcase/`, the curated customer-facing gallery — only flows with `public: true` that are passing. CLI `--showcase` also enables. |
+| `showcase_title` | string | Showcase headline (default `<product_name> in action`). |
+| `showcase_tagline` | string | Sub-line under the showcase headline. |
+| `showcase_accent` | string | Showcase accent color (a hex value also re-tints the translucent glows). |
+| `showcase_logo` | path | Logo embedded into the showcase header (svg/png/jpg/gif/webp; relative to this file). |
+| `showcase_css` | path | Raw CSS appended to the showcase page — full styling control (relative to this file). |
 | `public_url` | string | Public gallery URL for notifications/links. |
 | `notify_webhook` | string | Slack incoming-webhook URL. |
 | `analytics` | string | Raw HTML injected into every page's `<head>` (BYO Plausible/GA/…). |
@@ -53,7 +70,7 @@ flows:                              # keyed by flow slug (matches the gallery ou
 | Key | Type | Meaning |
 |---|---|---|
 | `title` | string | Friendly title (overrides the path-derived one). |
-| `public` | bool | Tags the card `public` and marks it public in the manifest. |
+| `public` | bool | Tags the card `public`, marks it public in the manifest, and includes it in the [showcase](gallery-and-publish.md#customer-facing-showcase) when passing. |
 | `hidden` | bool | Excludes the flow from the gallery entirely. |
 | `healed` | bool | Forces the amber `⟳ updated` state (for a CI self-healing step). |
 

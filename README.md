@@ -85,6 +85,11 @@ language-agnostic.
   `manifest.json`; a flow that changed but still passes gets an amber `⟳ updated`
   badge (the UI moved, the test stayed green, the demo refreshed).
 - **`gallery.html`** is a single self-contained file — email it, or host it anywhere.
+- **Showcase** (`--showcase` or `showcase: true`): a second, **customer-facing**
+  render at `site/showcase/` — only flows marked `public: true` that are passing, no
+  failure states, brandable (`showcase_*` keys), with a "verified · build · date"
+  provenance badge. Excluded flows are *absent from the directory*, not hidden —
+  share `/showcase/` and the internal view never reaches customers.
 - **Themes:** `--theme dark|light` (or `theme:` in config).
 
 ## AI narration
@@ -108,6 +113,7 @@ product_name: My App        # AI narration says this, not localhost URLs
 theme: dark                 # dark | light
 ai: false                   # true (+ key) to narrate
 bundle: false               # true to also emit gallery.html
+showcase: false             # true to also emit showcase/ (curated, customer-facing)
 setup_urls: [/login]        # leading nav steps to drop from every demo
 flows:
   signup: { title: Sign up, public: true }

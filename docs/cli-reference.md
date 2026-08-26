@@ -21,6 +21,12 @@ Specreel has one default command (render a trace or a directory) plus a few verb
   `specreel.yml`. (The single-file `gallery.html` bundle always uses one frame per
   step so it stays email-sized.)
 - `--gif` — also export `demo.gif` (needs `ffmpeg`) — the artifact for READMEs and PRs.
+- `--showcase` — also emit `showcase/`, the **curated customer-facing gallery**: only
+  flows marked `public: true` in `specreel.yml` that are **passing**. Failing and
+  internal flows aren't hidden, their files simply aren't in that directory. Brandable
+  via the `showcase_*` [config keys](configuration.md); details + publish patterns in
+  [gallery & publishing](gallery-and-publish.md#customer-facing-showcase). Or set
+  `showcase: true` in `specreel.yml` (batch mode).
 - `--theme dark|light` — color theme (default `dark`; or set `theme:` in config).
 - `--config PATH` — path to `specreel.yml` (auto-discovered in CWD / the traces dir otherwise).
 - `--ai` — opt-in [AI narration](ai-narration.md) (needs `ANTHROPIC_API_KEY`).
@@ -31,14 +37,25 @@ Specreel has one default command (render a trace or a directory) plus a few verb
 - `--voice [NAME]` — **studio voiceover**: pre-render neural TTS narration per step and
   embed it (BYO `OPENAI_API_KEY`). Default voice `nova` (also alloy/echo/fable/onyx/
   shimmer/…). The player prefers this audio and falls back to the browser voice per step.
+  A demo built with voiceover defaults its sound toggle **on** (audio still starts only
+  on the viewer's Play click; their on/off choice is remembered per browser), and
+  `--mp4` gets the narration **muxed in as a real audio track** — steps stretch so a
+  sentence is never cut short.
 - `--tts-model MODEL` — TTS model for `--voice` (default `gpt-4o-mini-tts`; `tts-1`
   cheaper, `tts-1-hd` higher fidelity).
 - `--tts-key KEY` — OpenAI key for `--voice` (else `OPENAI_API_KEY`).
-  Config equivalents: `voice:` / `tts_model:` in `specreel.yml`.
+- `--tts-instructions TEXT` — delivery notes for the narrator (`gpt-`* TTS models only,
+  e.g. `"upbeat, brisk"`; default: a calm product-demo narrator).
+  Config equivalents: `voice:` / `tts_model:` / `tts_instructions:` in `specreel.yml`.
 
 > Studio voiceover pairs well with `--ai` (it narrates the friendly prose). It costs a
 > few cents/flow and adds audio bytes to the HTML; the free browser-voice default needs
-> no key and no audio files.
+> no key and no audio files. Clips are cached in `~/.cache/specreel/tts` keyed on
+> (model, voice, instructions, words), so a CI rebuild only pays for steps whose words
+> changed — point `SPECREEL_TTS_CACHE` at a persisted directory in CI (e.g. via
+> `actions/cache`), or set it to `off` to disable. Failed steps are narrated as failures
+> ("This step failed: …, the reason"), and masked secrets (`•••`) are spoken as
+> "the hidden value", never read out.
 
 ```bash
 specreel trace.zip -o out/ --title "Checkout"

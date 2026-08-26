@@ -25,8 +25,11 @@ cookie too (copy it from your browser's devtools → Application → Cookies).
 - **refine the whole set in English** — e.g. *"focus on checkout, drop the
   marketing pages"*.
 
-**4. Create the project.** You land on a setup screen — you can ignore the CI
-snippets for now and just use hosted runs:
+**4. Create the project.** You pick how the flows stay proven:
+- **Run in Specreel** (recommended if you don't have a suite yet) — we keep the
+  flows here and run the browsers.
+- **Add to CI** — for your engineering team: commit a script + GitHub Action.
+- **I'll do it myself** — skip, publish from the CLI later.
 
 **5. Run it.** On the project's **Hosted runs** page (or the Scenarios card), press
 **Run now**. Specreel replays your flows in a real browser, renders the demos, and

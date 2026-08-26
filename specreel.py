@@ -36,13 +36,23 @@ def load_events(trace_dir):
 # actions that are plumbing, not user-meaningful demo steps
 SKIP_METHODS = {"newPage", "newContext", "close", "setContent", "waitForLoadState",
                 "addInitScript", "setViewportSize", "tracingStart", "tracingStop",
-                "waitForTimeout", "waitForEventInfo", "waitForURL",
-                # synchronization waits are plumbing, not demo-worthy actions;
-                # surfacing them reads as "Wait for the element". Dropping them
-                # also lets a `goto` immediately followed by a wait become the
-                # flow's last step, which then pins to the settled destination.
-                "waitForSelector", "waitForFunction", "waitForResponse",
-                "waitForRequest"}
+                "waitForTimeout", "waitForEventInfo",
+                # Playwright ≥1.53 emits waits as `__waitInfo__` (replaces
+                # waitForEventInfo). Leaving it through humanize's fallback
+                # captions the step as literally "__waitInfo__" (AI then invents
+                # "Wait a moment while things load" on top).
+                "__waitInfo__",
+                # Element/network plumbing — not demo-worthy. Outcome waits
+                # (`waitForURL`, `waitForFunction`) are kept: chat replies and
+                # scorecard results must be visible steps or the demo ends on
+                # Send/Run before the UI catches up.
+                "waitForSelector", "waitForResponse",
+                "waitForRequest",
+                # Read/scroll helpers — steal frame windows from the real click/
+                # fill they sandwich, and caption as gibberish ("innerText").
+                "scrollIntoViewIfNeeded", "innerText", "textContent",
+                "inputValue", "getAttribute", "evaluate", "evaluateHandle",
+                "evaluateExpression", "evalOnSelector", "evalOnSelectorAll"}
 
 
 def _is_main_frame(snap):
@@ -92,7 +102,10 @@ def build_steps(events):
     steps = []
     for cid, b in befores.items():
         method = b.get("method", "")
-        if method in SKIP_METHODS:
+        # Skip known plumbing + any Playwright protocol/internal method
+        # (`__waitInfo__`, `__abort__`, …) so new PW versions don't leak raw
+        # protocol names into demo captions.
+        if method in SKIP_METHODS or method.startswith("__"):
             continue
         a = afters.get(cid, {})
         steps.append({
@@ -532,6 +545,18 @@ def humanize(step):
         return f"Confirm {tgt} {predicate(exp, p)}", "check"
     if m in ("waitForSelector", "waitFor"):
         return f"Wait for {humanize_selector(p.get('selector'))}", "action"
+    if m == "waitForURL":
+        hint = json.dumps(p.get("url") or p.get("glob") or "")
+        if re.search(r"persona-reaction|reaction|results", hint, re.I):
+            return "Wait for the results", "action"
+        if re.search(r"login|sign[-_]?in", hint, re.I):
+            return "Wait for sign-in to finish", "action"
+        return "Wait for the page to load", "action"
+    if m == "waitForFunction":
+        expr = str(p.get("expression") or p.get("function") or "")
+        if re.search(r"google|reply|message|innerText|textContent|response", expr, re.I):
+            return "Wait for the response", "action"
+        return "Wait for the page to update", "action"
     return m, "action"
 
 
@@ -673,17 +698,48 @@ def narrate(rendered, title, api_key, model=DEFAULT_AI_MODEL, timeout=60, produc
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"   # also: tts-1 (cheap), tts-1-hd (higher fidelity)
 DEFAULT_TTS_VOICE = "nova"              # alloy/echo/fable/onyx/nova/shimmer/sage/coral…
+# gpt-4o-mini-tts accepts free-text delivery notes; tts-1/tts-1-hd reject the field
+DEFAULT_TTS_INSTRUCTIONS = ("Calm, friendly product-demo narrator. Moderate pace, "
+                            "natural emphasis; read UI names as plain words.")
+_TTS_RETRY_SLEEP = 0.8
 
 
 def resolve_tts_key(explicit=None):
     return explicit or os.environ.get("OPENAI_API_KEY") or ""
 
 
-def _openai_tts(text, key, voice, model, fmt="mp3", timeout=30):
+def tts_cache_dir():
+    """Where synthesized clips are cached across builds. CI re-renders demos every
+    build; a step whose words didn't change shouldn't re-bill. Override with
+    SPECREEL_TTS_CACHE=<dir>; disable with SPECREEL_TTS_CACHE=off."""
+    env = os.environ.get("SPECREEL_TTS_CACHE", "")
+    if env.lower() in ("0", "off", "none", "no"):
+        return None
+    return env or os.path.join(os.path.expanduser("~"), ".cache", "specreel", "tts")
+
+
+def speakable(step):
+    """The text a step's narration should SAY: failure wording included (a listener
+    can't see the red caption bar), masked secrets (•••) and url schemes translated
+    for the ear."""
+    t = (step.get("narration") or step.get("caption") or "").strip()
+    if not t:
+        return ""
+    if step.get("failed"):
+        why = (step.get("why") or "").strip()
+        t = "This step failed: " + t + (". " + why if why else "")
+    t = re.sub(r"•+", "the hidden value", t)
+    t = re.sub(r"https?://", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _openai_tts(text, key, voice, model, fmt="mp3", timeout=30, instructions=""):
     """One TTS call → audio bytes. Isolated for mockability."""
     import urllib.request
-    body = json.dumps({"model": model, "voice": voice, "input": text,
-                       "response_format": fmt}).encode("utf-8")
+    payload = {"model": model, "voice": voice, "input": text, "response_format": fmt}
+    if instructions:
+        payload["instructions"] = instructions
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(OPENAI_TTS_URL, data=body, headers={
         "Authorization": "Bearer " + key, "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -691,26 +747,68 @@ def _openai_tts(text, key, voice, model, fmt="mp3", timeout=30):
 
 
 def synthesize_voiceover(rendered, key, voice=DEFAULT_TTS_VOICE, model=DEFAULT_TTS_MODEL,
-                         timeout=30, verbose=False):
+                         timeout=30, verbose=False, instructions=None, workers=4):
     """Attach a base64 audio clip to each step (step['audio']) by synthesizing its
-    narration/caption. Best-effort and per-step graceful — a failed clip just falls
-    back to the browser voice for that step. Returns the number of clips made."""
+    narration/caption. Clips are disk-cached by (model, voice, instructions, text)
+    and synthesis fans out over a few threads with one retry per clip. Best-effort
+    and per-step graceful — a failed clip just falls back to the browser voice for
+    that step. Returns the number of clips attached."""
     if not key:
         return 0
-    made = 0
-    for r in rendered:
-        text = (r.get("narration") or r.get("caption") or "").strip()
-        if not text:
-            continue
-        try:
-            audio = _openai_tts(text, key, voice, model, timeout=timeout)
+    if instructions is None:
+        instructions = DEFAULT_TTS_INSTRUCTIONS if model.startswith("gpt-") else ""
+    jobs = [(r, speakable(r)) for r in rendered]
+    jobs = [(r, t) for r, t in jobs if t]
+    if not jobs:
+        return 0
+    cache = tts_cache_dir()
+
+    def clip(text):
+        path = None
+        if cache:
+            h = hashlib.sha1("|".join((model, voice, instructions, text))
+                             .encode("utf-8")).hexdigest()
+            path = os.path.join(cache, h + ".mp3")
+            try:
+                with open(path, "rb") as f:
+                    return f.read(), True
+            except OSError:
+                pass
+        for attempt in (1, 2):          # one retry — a blip shouldn't mute a step
+            try:
+                audio = _openai_tts(text, key, voice, model, timeout=timeout,
+                                    instructions=instructions)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(_TTS_RETRY_SLEEP)
+        if path:
+            try:
+                os.makedirs(cache, exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(audio)
+            except OSError:
+                pass
+        return audio, False
+
+    from concurrent.futures import ThreadPoolExecutor
+    made = hits = 0
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
+        futs = [(r, ex.submit(clip, t)) for r, t in jobs]
+        for r, fut in futs:
+            try:
+                audio, hit = fut.result()
+            except Exception as e:
+                sys.stderr.write(f"specreel: voiceover clip failed ({type(e).__name__}: {e}) "
+                                 f"— that step uses the browser voice\n")
+                continue
             r["audio"] = "data:audio/mpeg;base64," + base64.b64encode(audio).decode()
             made += 1
-        except Exception as e:
-            sys.stderr.write(f"specreel: voiceover clip failed ({type(e).__name__}: {e}) "
-                             f"— that step uses the browser voice\n")
+            hits += 1 if hit else 0
     if verbose and made:
-        print(f"  voiceover: {made} clips via {model}/{voice}")
+        print(f"  voiceover: {made} clips via {model}/{voice}"
+              + (f" ({hits} cached)" if hits else ""))
     return made
 
 
@@ -845,6 +943,7 @@ def build_html(rendered, title, out_dir, theme="dark", analytics=""):
         .replace("__TITLE__", html.escape(title)) \
         .replace("__NACT__", str(n_actions)).replace("__NCHK__", str(n_checks)) \
         .replace("__DATE__", time.strftime("%b %d, %Y")) \
+        .replace("__TTSJS__", TTS_JS) \
         .replace("__STEPS__", steps_json)
     path = os.path.join(out_dir, "demo.html")
     with open(path, "w", encoding="utf-8") as f:
@@ -974,11 +1073,14 @@ def _card(W, H, kick, headline, sub, accent=(95, 241, 155)):
 
 def _caption_frames(rendered, frames_dir, W=1280, motion=True):
     """Composite every playable frame (each step's clip, or its single still)
-    with the caption bar. Returns [(path, seconds)] in playback order."""
+    with the caption bar. Returns (items, spans): items = [(path, seconds)] in
+    playback order; spans = [(step, first, last)] mapping each step that produced
+    frames to its slice of items (so audio can be laid onto the same timeline)."""
     from PIL import Image, ImageDraw
     f_cap = _load_font(bold=True, size=30)
     f_lbl = _load_font(bold=False, size=20)
     out = []
+    spans = []
     idx = 0
     for r in rendered:
         imgs = (r.get("imgs") or []) if motion else []
@@ -986,6 +1088,7 @@ def _caption_frames(rendered, frames_dir, W=1280, motion=True):
             imgs = [r["img"]] if r.get("img") else []
         if not imgs:
             continue
+        first = idx
         dts = (r.get("dts") or []) if motion else []
         # hold each clip frame for its recorded gap; the final frame of a step
         # holds for the remainder of the step's display duration (the beat that
@@ -1020,7 +1123,92 @@ def _caption_frames(rendered, frames_dir, W=1280, motion=True):
                 dur = max(0.08, (dts[j + 1] if j + 1 < len(dts) else 120) / 1000.0)
             out.append((outp, round(dur, 3)))
             idx += 1
-    return out
+        spans.append((r, first, idx - 1))
+    return out, spans
+
+
+# MP4 timeline bookends (title card in, outcome card out) — the audio track is
+# planned against the same constants so narration stays step-aligned.
+_MP4_LEAD, _MP4_TAIL = 2.0, 2.6
+
+
+def plan_voiceover(step_durs, clip_durs, lead=_MP4_LEAD, tail=_MP4_TAIL, breath=0.35):
+    """Fit narration clips onto the MP4 timeline. step_durs[k] = a step's video
+    seconds; clip_durs[k] = its narration clip's seconds (None = no clip). A clip
+    that outruns its step extends the step's last-frame hold rather than being cut
+    mid-sentence. Returns (extend, segments): extend[k] = extra hold seconds for
+    step k; segments = [('silence', dur) | ('clip', k, dur)] covering
+    lead + every step + tail exactly. Pure and unit-tested."""
+    extend, segments = [], [("silence", round(lead, 3))]
+    for k, (sd, cd) in enumerate(zip(step_durs, clip_durs)):
+        ext = round(max(0.0, cd + breath - sd), 3) if cd is not None else 0.0
+        extend.append(ext)
+        dur = round(sd + ext, 3)
+        segments.append(("clip", k, dur) if cd is not None else ("silence", dur))
+    segments.append(("silence", round(tail, 3)))
+    return extend, segments
+
+
+def _probe_duration(path):
+    """Seconds of audio in a file, via ffprobe (ships alongside ffmpeg). None if
+    ffprobe is missing or the file is unreadable."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                            "format=duration", "-of", "csv=p=0", path],
+                           capture_output=True, text=True)
+        return float(r.stdout.strip()) if r.returncode == 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _voiceover_track(spans, items, frames_dir):
+    """Decode each step's narration clip, measure it, and lay the clips onto the
+    MP4 timeline. May lengthen a step's last-frame hold in `items` in place (a
+    clip must not be cut mid-sentence). Returns (clip_paths, audio_filtergraph)
+    for ffmpeg, or None when there's no usable audio (no clips, no ffprobe,
+    undecodable data) — the MP4 then ships silent exactly as before."""
+    step_durs, clip_durs, paths = [], [], []
+    for n, (r, a, b) in enumerate(spans):
+        step_durs.append(round(sum(items[j][1] for j in range(a, b + 1)), 3))
+        data = r.get("audio") or ""
+        if data.startswith("data:audio"):
+            p = os.path.join(frames_dir, f"vo_{n}.mp3")
+            try:
+                with open(p, "wb") as fh:
+                    fh.write(base64.b64decode(data.split(",", 1)[1]))
+            except (ValueError, OSError):
+                return None
+            d = _probe_duration(p)
+            if d is None:
+                return None
+            paths.append(p)
+            clip_durs.append(round(d, 3))
+        else:
+            paths.append(None)
+            clip_durs.append(None)
+    if not any(paths):
+        return None
+    extend, segments = plan_voiceover(step_durs, clip_durs)
+    for n, ext in enumerate(extend):
+        if ext:
+            last = spans[n][2]
+            p, dur = items[last]
+            items[last] = (p, round(dur + ext, 3))
+    # one filtergraph: each clip padded/trimmed to exactly its step's screen time,
+    # silence elsewhere, all concatenated — no mixing, so alignment is exact
+    inputs, chains, labels = [], [], []
+    for k, seg in enumerate(segments):
+        if seg[0] == "clip":
+            inputs.append(paths[seg[1]])
+            chains.append(f"[{len(inputs)}:a]aresample=24000,"
+                          "aformat=sample_fmts=fltp:channel_layouts=mono,"
+                          f"apad=whole_dur={seg[2]},atrim=0:{seg[2]}[a{k}]")
+        else:
+            chains.append(f"anullsrc=r=24000:cl=mono:d={seg[1]},"
+                          f"aformat=sample_fmts=fltp:channel_layouts=mono[a{k}]")
+        labels.append(f"[a{k}]")
+    chains.append("".join(labels) + f"concat=n={len(labels)}:v=0:a=1[voix]")
+    return inputs, ";".join(chains)
 
 
 def _write_concat(items, path):
@@ -1032,14 +1220,22 @@ def _write_concat(items, path):
 
 
 def build_mp4(rendered, title, out_dir, trace_dir, failed=False):
-    """Motion MP4: every captured frame, bookended by a title and outcome card."""
+    """Motion MP4: every captured frame, bookended by a title and outcome card.
+    Steps carrying studio voiceover clips get them muxed in as a real audio track
+    (a narrated MP4 is the shareable artifact); without clips the file is silent."""
     from PIL import Image
     frames_dir = os.path.join(out_dir, "_frames")
     os.makedirs(frames_dir, exist_ok=True)
     try:
-        items = _caption_frames(rendered, frames_dir)
+        items, spans = _caption_frames(rendered, frames_dir)
         if not items:
             return None
+        vo = None
+        if any((r.get("audio") or "").startswith("data:audio") for r in rendered):
+            vo = _voiceover_track(spans, items, frames_dir)
+            if vo is None:
+                sys.stderr.write("specreel: voiceover clips present but ffprobe/"
+                                 "decoding unavailable — writing a silent MP4\n")
         W, H = Image.open(items[0][0]).size
         n_act = sum(1 for r in rendered if r["kind"] != "check")
         n_chk = sum(1 for r in rendered if r["kind"] == "check")
@@ -1053,13 +1249,24 @@ def build_mp4(rendered, title, out_dir, trace_dir, failed=False):
               ("A step failed on the last run" if failed
                else "Generated from a passing test") + " · " + time.strftime("%b %d, %Y"),
               accent=accent).save(outro)
-        items = [(intro, 2.0)] + items + [(outro, 2.6)]
+        items = [(intro, _MP4_LEAD)] + items + [(outro, _MP4_TAIL)]
         listfile = os.path.join(frames_dir, "list.txt")
         _write_concat(items, listfile)
         mp4 = os.path.join(out_dir, "demo.mp4")
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
-               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
-               "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium", mp4]
+        if vo:
+            clip_paths, afilter = vo
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile]
+            for p in clip_paths:
+                cmd += ["-i", p]
+            cmd += ["-filter_complex",
+                    "[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30[v];" + afilter,
+                    "-map", "[v]", "-map", "[voix]",
+                    "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium",
+                    "-c:a", "aac", "-b:a", "128k", mp4]
+        else:
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
+                   "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
+                   "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "medium", mp4]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             sys.stderr.write(r.stderr[-800:])
@@ -1076,7 +1283,7 @@ def build_gif(rendered, title, out_dir, trace_dir, failed=False, width=900):
     frames_dir = os.path.join(out_dir, "_gif")
     os.makedirs(frames_dir, exist_ok=True)
     try:
-        items = _caption_frames(rendered, frames_dir, W=width)
+        items, _ = _caption_frames(rendered, frames_dir, W=width)
         if not items:
             return None
         listfile = os.path.join(frames_dir, "list.txt")
@@ -1114,7 +1321,7 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
                   setup_urls=None, ai=False, api_key=None, ai_model=DEFAULT_AI_MODEL,
                   product="", collect=False, theme="dark", analytics="",
                   voice=None, tts_model=DEFAULT_TTS_MODEL, tts_key=None,
-                  quality=DEFAULT_QUALITY, want_gif=False):
+                  tts_instructions=None, quality=DEFAULT_QUALITY, want_gif=False):
     """Render a single trace.zip into out_dir/demo.html (+ optional demo.mp4).
 
     Returns a stats dict: title, html, mp4, n_actions, n_checks, n_steps, failed,
@@ -1129,6 +1336,11 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
         events = load_events(tmp)
         steps, frames = build_steps(events)
         steps = coalesce_steps(steps)
+        # Setup trim (login / auth redirect) can wipe every step when the run
+        # dies on the sign-in page — remember that so we don't report a green
+        # empty demo as "ok" / "passing".
+        n_before_trim = len(steps)
+        had_error_before_trim = any(s.get("error") for s in steps)
         steps = trim_setup_steps(steps, setup_urls)
         attach_frames(steps, frames)
         attach_clip_frames(steps, frames,
@@ -1146,12 +1358,20 @@ def generate_demo(trace_path, out_dir, title=None, want_mp4=False, verbose=True,
         # Studio voiceover (opt-in, BYO-key): pre-render neural TTS per step.
         if voice:
             synthesize_voiceover(rendered, resolve_tts_key(tts_key), voice=voice,
-                                 model=tts_model, verbose=verbose)
+                                 model=tts_model, verbose=verbose,
+                                 instructions=tts_instructions)
 
         html_path = build_html(rendered, title, out_dir, theme=theme, analytics=analytics)
         n_act = sum(1 for r in rendered if r["kind"] != "check")
         n_chk = sum(1 for r in rendered if r["kind"] == "check")
         failed = any(r["failed"] for r in rendered)
+        # A blank demo is never a pass: either the trace had nothing, or setup
+        # trim removed a failed login / auth-wall run (hosted false-success).
+        if not rendered:
+            failed = True
+            if verbose and (n_before_trim or had_error_before_trim):
+                print("  ⚠ empty after setup trim — marking failed "
+                      f"(had {n_before_trim} step(s) before trim)")
         # demo playback length (what the viewer experiences on ▶), not test runtime
         duration = sum(r["dur"] for r in rendered)
         thumb = next((r["img"] for r in reversed(rendered) if r.get("img")), "")
@@ -1341,13 +1561,16 @@ def title_from_trace_path(path, root):
     return humanize_name(name).strip() or "demo"
 
 
-def build_manifest(entries, out_dir, ctx, title):
+def build_manifest(entries, out_dir, ctx, title, showcase=False):
     """Machine-readable index of the gallery — for a future hosted index page,
     a status check, or wiring demos into docs. Sits next to index.html."""
     data = {
         "title": title or "",
         "repo": ctx.get("repo", ""), "branch": ctx.get("branch", ""),
         "build": ctx.get("build", ""),
+        # true when this build also carries showcase/ — the curated,
+        # customer-facing render (public & passing flows only)
+        "showcase": bool(showcase),
         "flows": [{
             "slug": e["slug"], "title": e["title"], "public": e.get("public", False),
             "steps": e["n_steps"], "actions": e["n_actions"], "checks": e["n_checks"],
@@ -1393,10 +1616,154 @@ def build_bundle(entries, out_dir, ctx=None, gallery_title="", theme="dark", ana
     tpl = (BUNDLE_TEMPLATE.replace("__THEMEVARS__", theme_block(theme))
            .replace("__ANALYTICS__", analytics)
            .replace("__OG__", og_meta(gallery_title or "Specreel demos", og_desc))
+           .replace("__TTSJS__", TTS_JS)
            .replace("__DATA__", _script_json(data)))
     path = os.path.join(out_dir, "gallery.html")
     with open(path, "w", encoding="utf-8") as f:
         f.write(tpl)
+    return path
+
+
+def _inline_asset(path):
+    """Read a small local image into a data: URI (showcase logo embedding)."""
+    mimes = {".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+             ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+    mime = mimes.get(os.path.splitext(path)[1].lower())
+    if not mime or not os.path.isfile(path):
+        return ""
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode("ascii")
+
+
+def _accent_css(color):
+    """CSS overriding the accent color for the showcase. A hex color also
+    re-tints the translucent glows; any other CSS color swaps the accent only."""
+    color = (color or "").strip()
+    if not color:
+        return ""
+    m = re.fullmatch(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", color)
+    if not m:
+        return ":root{--green:" + color + "}"
+    h = m.group(1)
+    if len(h) == 3:
+        h = "".join(c + c for c in h)
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    dim, glow, off = (f"rgba({r},{g},{b},.09)", f"rgba({r},{g},{b},.5)",
+                      f"rgba({r},{g},{b},0)")
+    return (":root{--green:" + color + ";--green-dim:" + dim + "}"
+            "@keyframes pulse{0%{box-shadow:0 0 0 0 " + glow + "}"
+            "70%{box-shadow:0 0 0 7px " + off + "}"
+            "100%{box-shadow:0 0 0 0 " + off + "}}")
+
+
+def build_showcase(entries, out_dir, ctx=None, cfg=None, theme="dark",
+                   analytics="", cfg_dir="", bundle=False):
+    """The curated, customer-facing render of the same build: only flows marked
+    `public: true` that are passing, written to out_dir/showcase/.
+
+    A separate directory, not a filtered view — the players embed their frames,
+    so a failing or internal flow hidden with CSS in a shared asset would still
+    ship its bytes to anyone who views source. Curation has to happen here, at
+    generation time. Provenance (build + verify date) stays visible: that the
+    demos are re-verified every build is the trust mark; the failures are the
+    internal gallery's business."""
+    cfg, ctx = cfg or {}, ctx or {}
+    sc_dir = os.path.join(out_dir, "showcase")
+    # always start clean — a flow that was public last build but is failing or
+    # private now must not linger from an earlier render
+    shutil.rmtree(sc_dir, ignore_errors=True)
+    public = [e for e in entries if e.get("public")]
+    include = [e for e in public if not e["failed"]]
+    for e in public:
+        if e["failed"]:
+            print(f"  showcase: [{e['slug']}] failing — left out of this build")
+    if not public:
+        sys.stderr.write("  showcase: no flows marked `public: true` in "
+                         "specreel.yml — nothing to include\n")
+        return None
+    if not include:
+        sys.stderr.write("  showcase: every public flow is failing — no curated "
+                         "gallery this build\n")
+        return None
+    os.makedirs(sc_dir)
+    for e in include:
+        shutil.copytree(os.path.join(out_dir, e["slug"]),
+                        os.path.join(sc_dir, e["slug"]))
+
+    product = cfg.get("product_name") or ""
+    headline = cfg.get("showcase_title") or (
+        f"{product} in action" if product else "See it in action")
+    tagline = cfg.get("showcase_tagline") or (
+        "Every demo below was generated from a real, passing product flow — "
+        "regenerated and re-verified on each release.")
+    logo_html = ""
+    if cfg.get("showcase_logo"):
+        lp = cfg["showcase_logo"]
+        lp = lp if os.path.isabs(lp) else os.path.join(cfg_dir or ".", lp)
+        data = _inline_asset(lp)
+        if data:
+            logo_html = f'<img class="plogo" src="{data}" alt="">'
+        else:
+            sys.stderr.write(f"  showcase: logo not found or unsupported type: "
+                             f"{cfg['showcase_logo']}\n")
+    brand = (f'{logo_html}<span class="pname">{html.escape(product)}</span>'
+             if (logo_html or product)
+             else '<span class="logo">specreel<span class="dot">.</span></span>')
+    custom_css = ""
+    if cfg.get("showcase_css"):
+        cp = cfg["showcase_css"]
+        cp = cp if os.path.isabs(cp) else os.path.join(cfg_dir or ".", cp)
+        try:
+            custom_css = open(cp, encoding="utf-8").read()
+        except OSError:
+            sys.stderr.write(f"  showcase: css file not found: {cfg['showcase_css']}\n")
+
+    date = time.strftime("%b %d, %Y")
+    build = ctx.get("build", "")
+    proof = ('<span class="build"><span class="pulse"></span>verified'
+             + (f" · build {html.escape(build)}" if build else "")
+             + f" · {date}</span>")
+    cards = []
+    for e in include:
+        thumb = (f'<div class="thumb" style="background-image:url(\'{e["thumb"]}\')"></div>'
+                 if e.get("thumb") else '<div class="thumb empty"></div>')
+        cards.append(
+            f'<a class="card" data-title="{html.escape(e["title"]).lower()}" '
+            f'href="{html.escape(e["slug"])}/demo.html">'
+            f'{thumb}<div class="cbody"><div class="ct">{html.escape(e["title"])}</div>'
+            f'<div class="cmeta"><span class="dur">▶ {fmt_duration(e.get("duration", 0))}</span>'
+            f'<span class="ok">✓ verified</span></div></div></a>')
+    n = len(include)
+    og_desc = (f"{n} product demo{'s' if n != 1 else ''} — generated from real "
+               f"flows, verified {date}.")
+    tpl = (SHOWCASE_TEMPLATE
+           .replace("__THEMEVARS__", theme_block(theme))
+           .replace("__ACCENT__", _accent_css(cfg.get("showcase_accent") or ""))
+           .replace("__CUSTOMCSS__", custom_css)
+           .replace("__ANALYTICS__", analytics)
+           .replace("__OG__", og_meta(headline, og_desc))
+           .replace("__BRAND__", brand)
+           .replace("__PROOF__", proof)
+           .replace("__KICKER__", html.escape(product or "Product demos"))
+           .replace("__HEADLINE__", html.escape(headline))
+           .replace("__TAGLINE__", html.escape(tagline))
+           .replace("__CARDS__", "\n".join(cards))
+           .replace("__COUNT__", f"{n} demo{'s' if n != 1 else ''}")
+           .replace("__DATE__", date))
+    path = os.path.join(sc_dir, "index.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(tpl)
+    # curated manifest: what the showcase contains and when it was verified —
+    # deliberately no health fields (this file is public alongside the pages)
+    man = {"title": headline, "build": build, "date": date,
+           "flows": [{"slug": e["slug"], "title": e["title"],
+                      "duration": round(e.get("duration", 0), 2),
+                      "demo": f"{e['slug']}/demo.html"} for e in include]}
+    with open(os.path.join(sc_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(man, f, indent=2)
+    if bundle:
+        build_bundle(include, sc_dir, ctx=ctx, gallery_title=headline,
+                     theme=theme, analytics=analytics)
     return path
 
 
@@ -1434,7 +1801,8 @@ def notify_slack(webhook, payload, timeout=15):
 def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
                      ai=False, api_key=None, ai_model=None, bundle=False, theme=None,
                      notify=None, public_url="", voice=None, tts_model=None, tts_key=None,
-                     strict=False, quality=None, want_gif=False):
+                     tts_instructions=None, strict=False, quality=None, want_gif=False,
+                     showcase=False):
     """Batch mode: render every trace under `root` and write an index.html.
 
     Honors an optional specreel.yml: per-flow title/public/hidden, a gallery
@@ -1445,7 +1813,10 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
     if not traces:
         sys.stderr.write(f"No trace.zip found under {root}\n")
         return 1
-    cfg = load_config(find_config(config_path, root))
+    cfg_path = find_config(config_path, root)
+    cfg = load_config(cfg_path)
+    # showcase_logo / showcase_css paths resolve relative to the config file
+    cfg_dir = os.path.dirname(os.path.abspath(cfg_path)) if cfg_path else os.getcwd()
     flows_cfg = cfg.get("flows") or {}
     setup_urls = cfg.get("setup_urls") or []
     gallery_title = cfg.get("title") or ""
@@ -1457,6 +1828,7 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
         theme = "dark"
     analytics = cfg.get("analytics") or ""    # raw HTML snippet injected into <head>
     bundle = bundle or bool(cfg.get("bundle"))
+    showcase = showcase or bool(cfg.get("showcase"))
     quality = (quality or cfg.get("quality") or DEFAULT_QUALITY).lower()
     if quality not in QUALITY_FRAMES:
         quality = DEFAULT_QUALITY
@@ -1470,6 +1842,7 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
     # studio voiceover (opt-in, BYO OPENAI_API_KEY)
     voice = voice or cfg.get("voice")
     tts_model = tts_model or cfg.get("tts_model") or DEFAULT_TTS_MODEL
+    tts_instructions = tts_instructions or cfg.get("tts_instructions")
     tts_key = resolve_tts_key(tts_key)
     if voice and not tts_key:
         sys.stderr.write("specreel: voice set but OPENAI_API_KEY is empty — "
@@ -1492,7 +1865,7 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
         except Exception:
             pass
     entries = []
-    used = set()
+    used = {"showcase"}      # reserved: the curated render lives at out/showcase/
     for tp in traces:
         title = title_from_trace_path(tp, root)
         slug = slugify(title)
@@ -1513,6 +1886,7 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
                                   ai=ai, api_key=api_key, ai_model=ai_model, product=product,
                                   collect=bundle, theme=theme, analytics=analytics,
                                   voice=voice, tts_model=tts_model, tts_key=tts_key,
+                                  tts_instructions=tts_instructions,
                                   quality=quality, want_gif=want_gif)
         except (zipfile.BadZipFile, OSError, KeyError, json.JSONDecodeError) as e:
             # one corrupt/vanished trace must not abort the other N-1 demos
@@ -1537,8 +1911,14 @@ def generate_gallery(root, out_dir, want_mp4=False, config_path=None,
     ctx = gather_build_context()
     index = build_index(entries, out_dir, ctx=ctx, gallery_title=gallery_title,
                         theme=theme, analytics=analytics)
-    manifest = build_manifest(entries, out_dir, ctx, gallery_title)
+    sc_path = build_showcase(entries, out_dir, ctx=ctx, cfg=cfg, theme=theme,
+                             analytics=analytics, cfg_dir=cfg_dir,
+                             bundle=bundle) if showcase else None
+    manifest = build_manifest(entries, out_dir, ctx, gallery_title,
+                              showcase=sc_path is not None)
     print(f"\n  {len(entries)} demos -> {index}\n  manifest -> {manifest}")
+    if sc_path:
+        print(f"  showcase -> {sc_path}  (curated: public & passing flows only)")
     if bundle:
         bpath = build_bundle(entries, out_dir, ctx=ctx, gallery_title=gallery_title,
                              theme=theme, analytics=analytics)
@@ -2167,9 +2547,28 @@ _BROWSER_EXTRACT = r"""() => {
     title: (document.title || '').trim(),
     headings: [...document.querySelectorAll('h1,h2,h3')].map(t).filter(Boolean).slice(0, 6),
     forms: forms,
-    buttons: [...document.querySelectorAll('button')].map(t).filter(Boolean).slice(0, 12),
+    // Prefer action buttons over chrome: drop loading spinners and keep enough
+    // that page-local CTAs ("From library", "Run scorecard") survive after nav.
+    buttons: [...document.querySelectorAll('button,[role=button]')].map(el => {
+        const a = (el.getAttribute('aria-label') || '').trim();
+        let tx = t(el);
+        // SPA buttons often concatenate idle+loading labels into one string
+        // ("Sign In Signing in...") — keep the idle name Playwright can match.
+        tx = tx.replace(/^(Sign In)\s*Signing in\.\.\.$/i, '$1')
+               .replace(/^(Log In)\s*Logging in\.\.\.$/i, '$1');
+        return (a && a.length < 60 && !/signing in/i.test(a) ? a : tx);
+      }).filter(x => x && x.length > 1 && x.length < 80 && !/^loading/i.test(x))
+      .filter((x, i, arr) => arr.findIndex(y => y.toLowerCase() === x.toLowerCase()) === i)
+      .slice(0, 40),
     inputs: inputs,
-    links: [...document.querySelectorAll('a[href]')].map(a => ({text: t(a), href: a.getAttribute('href')}))
+    links: [...document.querySelectorAll('a[href]')].map(a => ({text: t(a), href: a.getAttribute('href')})),
+    // role counts stop NL flows inventing checkbox/option clicks on pages that
+    // have none (Kumkuat audiences use "Add all" buttons, not checkboxes).
+    roles: {
+      checkbox: document.querySelectorAll('input[type=checkbox],[role=checkbox]').length,
+      option: document.querySelectorAll('[role=option]').length,
+      listitem: document.querySelectorAll('[role=listitem]').length,
+    },
   };
 }"""
 
@@ -2341,6 +2740,41 @@ def find_login_fields(pg):
     return {"user": ident, "password": pw, "submit": submit}
 
 
+def login_settle(lang="py", ind=""):
+    """Wait until a SPA sign-in actually leaves the login page.
+
+    `wait_for_load_state("load")` alone is not enough — many apps keep you on
+    /login until a XHR finishes, then client-route to the app. Hosted runs were
+    racing that redirect: flow `goto(BASE)` hit the marketing shell and every
+    authenticated click timed out."""
+    a = "await " if lang == "py" else "await "
+    if lang == "py":
+        # r-string inside generated source: leave the login/sign-in path
+        pred = r'lambda u: not re.search(r"/(login|sign[-_]?in)(/|$|\?)", u, re.I)'
+        return "\n".join([
+            f"{ind}try:",
+            f"{ind}    {a}page.wait_for_url({pred}, timeout=20000)",
+            f"{ind}except Exception:",
+            f"{ind}    pass",
+            f"{ind}{a}page.wait_for_timeout(800)",
+        ])
+    return "\n".join([
+        f"{ind}await page.waitForURL(u => !/\\/(login|sign[-_]?in)(\\/|$|\\?)/i.test(u), "
+        f"{{ timeout: 20000 }}).catch(() => {{}});",
+        f"{ind}await page.waitForTimeout(800);",
+    ])
+
+
+def ensure_login_settle(steps, lang="py"):
+    """Append a post-sign-in settle to stored/custom login steps when missing."""
+    text = (steps or "").rstrip()
+    if not text:
+        return text
+    if "wait_for_url" in text or "waitForURL" in text or "wait_for_function" in text:
+        return text
+    return text + "\n" + login_settle(lang=lang)
+
+
 def login_prelude(login_url, pg, lang="py", ind=""):
     """Generated login steps to run BEFORE a flow: open the login page, fill the
     credentials from {{SPECREEL_USER}}/{{SPECREEL_PASSWORD}}, submit, settle.
@@ -2369,8 +2803,9 @@ def login_prelude(login_url, pg, lang="py", ind=""):
                    f'{ind}{a}page.getByRole("button", {{ name: {nm} }}).first().click()')
     elif got["password"]:
         out.append(f'{ind}{a}{_locator_expr(got["password"], lang)}.press("Enter")')
-    out.append(f'{ind}{a}page.wait_for_load_state("load")'
-               if lang == "py" else f'{ind}{a}page.waitForLoadState("load")')
+    # Prefer URL-leave settle over load — SPA auth often finishes after "load".
+    settle = login_settle(lang=lang, ind=ind)
+    out.extend(settle.splitlines())
     return "\n".join(out)
 
 
@@ -2425,23 +2860,26 @@ def detect_login_wall(pages):
     return {"needed": False, "login_url": url, "reason": ""}
 
 
-def page_labels(pg, limit=14):
-    """The clickable things that ACTUALLY exist on a page — link and button text.
+def page_labels(pg, limit=40):
+    """The clickable things that ACTUALLY exist on a page — button text first,
+    then links.
 
     Carried onto every flow so the plain-English resolver can only reference
-    controls that are really there. Without this it invents plausible-sounding
-    names ("Read more") that don't exist, and the flow fails on the first click.
+    controls that are really there. Buttons come first: a 14-slot budget filled
+    by sidebar nav alone used to hide page CTAs ("From library", "Run scorecard"),
+    and the model invented near-miss names that timed out at run time.
     """
     out, seen = [], set()
-    for t in ([l.get("text", "") for l in pg.get("links", [])]
-              + list(pg.get("buttons", []))):
+    ordered = (list(pg.get("buttons", []))
+               + [l.get("text", "") for l in pg.get("links", [])])
+    for t in ordered:
         t = " ".join((t or "").split())[:60]
         # responsive nav renders the label twice (desktop+mobile spans) and the
         # texts concatenate: "Sign inSign in" -> "Sign in"
         h = len(t) // 2
         if h and t[:h] == t[h:]:
             t = t[:h]
-        if t and len(t) > 1 and t.lower() not in seen:
+        if t and len(t) > 1 and t.lower() not in seen and not t.lower().startswith("loading"):
             seen.add(t.lower())
             out.append(t)
         if len(out) >= limit:
@@ -2456,6 +2894,9 @@ def recommend_flows(pages, limit=8):
         head = pg["headings"][0] if pg["headings"] else ""
         short = pg["title"].split("—")[0].split("|")[0].strip() or pg["title"]
         labels = page_labels(pg)
+        roles = pg.get("roles") or {}
+        meta = {"labels": labels, "roles": roles,
+                "buttons": list(pg.get("buttons") or [])[:24]}
         for fm in pg["forms"]:
             fields = [x for x in fm["fields"] if _fillable(x)]
             if fields:
@@ -2463,17 +2904,17 @@ def recommend_flows(pages, limit=8):
                 # the submit click as a TODO — the title shouldn't claim otherwise.
                 forms.append({"type": "form", "score": 3, "url": pg["url"],
                               "title": f"Fill the {short} form", "heading": head,
-                              "page_title": short, "fields": fields[:6], "labels": labels})
+                              "page_title": short, "fields": fields[:6], **meta})
         s = next((x for x in pg["inputs"]
                   if x["type"] == "search" or "search" in (x["name"] + x["placeholder"]).lower()), None)
         if s:
             searches.append({"type": "search", "score": 2, "url": pg["url"],
                              "title": f"Search on {short}", "heading": head,
-                             "page_title": short, "fields": [s], "labels": labels})
+                             "page_title": short, "fields": [s], **meta})
         elif not pg["forms"] and head:
             navs.append({"type": "nav", "score": 1, "url": pg["url"],
                          "title": f"Open {short}", "heading": head,
-                         "page_title": short, "fields": [], "labels": labels})
+                         "page_title": short, "fields": [], **meta})
     def sig(fl):
         return "|".join(f'{f.get("name", "")}:{f.get("placeholder", "")}'
                         for f in fl["fields"])
@@ -2548,17 +2989,19 @@ def scaffold_script(flows, base, lang="py", login_steps=""):
         fl["slug"] = slugify_flow(fl["title"], used)
 
     def _settle(ind):
-        """Trailing settle: lets the page finish rendering so the trace's final
-        frames show the RESULT (else the demo cuts off right after the last
-        action). waitForLoadState/waitForTimeout are demo-invisible plumbing."""
+        """Trailing settle: give the page a beat so the trace's last frames show
+        the RESULT, not the click mid-flight.
+
+        Prefer `load` + a short pause over `networkidle`. Apps with open
+        websockets / analytics (chat, live scorecards) never go network-idle, so
+        a 4s networkidle wait times out, leaves a failed step in the trace
+        (demo shows FAIL even though the script caught it), and still doesn't
+        wait for the real outcome."""
         if lang == "py":
-            return [f"{ind}try:",
-                    f'{ind}    await page.wait_for_load_state("networkidle", timeout=4000)',
-                    f"{ind}except Exception:",
-                    f"{ind}    pass",
-                    f"{ind}await page.wait_for_timeout(700)"]
-        return [f"{ind}await page.waitForLoadState('networkidle', {{ timeout: 4000 }}).catch(() => {{}});",
-                f"{ind}await page.waitForTimeout(700);"]
+            return [f'{ind}await page.wait_for_load_state("load")',
+                    f"{ind}await page.wait_for_timeout(1200)"]
+        return [f"{ind}await page.waitForLoadState('load');",
+                f"{ind}await page.waitForTimeout(1200);"]
 
     def steps(fl, ind):
         pre = ""
@@ -2739,6 +3182,28 @@ NL_FLOW_SYSTEM = (
     "post titles), pick the closest real entry, or target the element structurally "
     "(e.g. the first article's link: page.locator(\"article a\").first) and leave a "
     "TODO. A name that isn't on the page makes the flow fail on the first click.\n"
+    "- NEVER invent URL paths. Navigate only to paths that appear in known_pages "
+    "(or BASE itself). If the user describes a feature whose page isn't listed, "
+    "goto the closest real URL and click a real `clickable` entry from there — "
+    "do not guess `/audience-scorecards`-style paths that aren't in the crawl.\n"
+    "- Prefer `page.goto(BASE + \"/known/path\")` when known_pages already has the "
+    "destination (e.g. Audience Scorecards → /simulations). Don't open BASE and "
+    "then click a sidebar label to reach a page whose URL you already know — "
+    "direct goto is faster and survives collapsed nav / slow SPA mounts.\n"
+    "- Do NOT emit a sign-in sequence (goto /login, fill email/password, Sign In). "
+    "The runner already signs in before your body runs. Start at the feature URL.\n"
+    "- Always chain `.first` (or `.nth(i)`) before `.click()` / `.fill()` on "
+    "get_by_role / get_by_placeholder — duplicate accessible names are common and "
+    "strict mode will fail the run.\n"
+    "- Respect each page's `roles` counts: if roles.checkbox is 0, do NOT call "
+    "get_by_role(\"checkbox\") — use a real button from `clickable` (e.g. \"Add all\"). "
+    "If roles.option is 0, do not click role=option; open a search/picker from "
+    "clickable/placeholders and pick the first result with a structural locator.\n"
+    "- Button `name=` strings must match `clickable` verbatim (case-sensitive "
+    "preferred). \"Select from library\" is wrong if the page only has \"From library\".\n"
+    "- If known_pages is empty, output ONLY `await page.goto(BASE)` plus a "
+    "`# TODO: no crawled pages — sign in / re-scan before regenerating` comment "
+    "and a title assertion. Inventing the rest is worse than a stub.\n"
     "- Prefer `.first` on a locator that could match several elements — an "
     "ambiguous locator is a strict-mode failure, not a passing demo.\n"
     "- A field with \"visible\": false EXISTS but is hidden (typically a search "
@@ -2754,6 +3219,13 @@ NL_FLOW_SYSTEM = (
     "`page.keyboard.press(\"End\")` — NEVER page.evaluate(window.scrollTo…): it "
     "throws while a navigation is in flight, and it renders no visible step in "
     "the demo. Scrolling via the mouse shows up as a real captioned step.\n"
+    "- After a click that navigates or kicks off work (submit, run, send), wait "
+    "for the OUTCOME — a URL change, a new message, a results heading — not "
+    "`networkidle` (SPAs with websockets never go idle and will just time out) "
+    "and not a blind short sleep. Example: "
+    "`await page.wait_for_url(re.compile(r\\\"results\\\"), timeout=60000)` or "
+    "`await page.get_by_text(re.compile(r\\\"score|reply\\\", re.I)).first.wait_for(timeout=60000)`. "
+    "Then pause ~1s so the demo captures the finished frame.\n"
     "- After a click that navigates, let the destination settle before acting on "
     "it (e.g. `await page.wait_for_load_state(\"load\")`).\n"
     "- Add exactly one assertion (expect(...)) for what should be true at the end. "
@@ -2796,17 +3268,147 @@ def normalize_flow_code(code, lang):
                         ln)
             fixed.append(ln)
         lines = fixed
-        body = "\n".join("    " + ln for ln in lines) or "    pass"
+        text = "\n".join(lines)
+        text = strip_embedded_login(text)
+        text = ensure_locator_first(text)
+        body = "\n".join("    " + ln for ln in text.splitlines()) or "    pass"
         try:
             compile("async def _f(page, BASE, expect):\n" + body, "<flow>", "exec")
         except SyntaxError as e:
             sys.stderr.write(f"nl_flow: generated python didn't compile ({e.msg} "
                              f"at line {e.lineno}) — discarding\n")
             return ""
+        return text
     else:
         lines = [("//" + ln.lstrip()[1:] if ln.lstrip().startswith("#") else ln)
                  for ln in lines]
-    return "\n".join(lines)
+        text = ensure_locator_first("\n".join(lines))
+        return text
+
+
+def strip_embedded_login(code):
+    """Drop a duplicated sign-in block the model sometimes prepends.
+
+    Hosted runs already inject login_prelude; a second goto(/login) + fill with
+    {{EMAIL}} (or a concatenated 'Sign In Signing in...' button) races setup trim
+    and leaves a blank failing demo."""
+    lines = code.splitlines()
+    saw_login = any(re.search(r'goto\([^)]*login', ln, re.I) for ln in lines)
+    if not saw_login:
+        return code
+    for i, ln in enumerate(lines):
+        # first real app navigation after the login detour
+        if re.search(r'goto\(\s*BASE\s*(\+\s*[\'"]/(?!login)|\)\s*$)', ln):
+            return "\n".join(lines[i:]).lstrip("\n")
+        if re.search(r'goto\(\s*BASE\s*\+\s*[\'"]/', ln) and not re.search(r'login', ln, re.I):
+            return "\n".join(lines[i:]).lstrip("\n")
+    return code
+
+
+def ensure_locator_first(code):
+    """Playwright strict mode: get_by_role('button', name='X').click() fails when
+    two matches exist (Kumkuat's 'Pick an Audience'). Prefer .first unless the
+    chain already picks nth/first/last."""
+    def fix(m):
+        s = m.group(0)
+        if re.search(r"\.(first|nth|last)\s*\(", s):
+            return s
+        return re.sub(r"\.(click|fill|check|press)\(\s*$", r".first.\1(", s)
+
+    return re.sub(
+        r"(?:page\.)?(?:get_by_role|get_by_placeholder|get_by_label|get_by_text|"
+        r"getByRole|getByPlaceholder|getByLabel|getByText)\("
+        r"[^\n]*?\.(?:click|fill|check|press)\(\s*",
+        fix, code)
+
+
+# get_by_role("button", name="From library")  /  getByRole('button', { name: '…' })
+_ROLE_NAME_RE = re.compile(
+    r"""get_by_role\(\s*['"](\w+)['"]\s*,\s*name\s*=\s*['"]([^'"]+)['"]"""
+    r"""|getByRole\(\s*['"](\w+)['"]\s*,\s*\{\s*name:\s*['"]([^'"]+)['"]""",
+    re.I)
+_ROLE_BARE_RE = re.compile(
+    r"""get_by_role\(\s*['"](checkbox|option|switch)['"]\s*\)"""
+    r"""|getByRole\(\s*['"](checkbox|option|switch)['"]\s*\)""",
+    re.I)
+_STRICT_CLICK_RE = re.compile(
+    r"""(get_by_role|get_by_placeholder|get_by_label|get_by_text)\([^;\n]+?\)\s*\.(click|fill|check|press)\("""
+)
+
+
+def lint_flow_against_context(code, context_flows):
+    """Flag invented locators before we save a flow that will fail on first run.
+
+    Returns a list of short issue strings (empty = looks grounded). Conservative:
+    unknown button names and checkbox/option use when the crawl saw none."""
+    if not code:
+        return ["empty code"]
+    known = set()
+    role_totals = {"checkbox": 0, "option": 0, "listitem": 0}
+    for f in context_flows or []:
+        for t in (f.get("labels") or []) + (f.get("buttons") or []) + (f.get("clickable") or []):
+            if t:
+                known.add(str(t).casefold())
+        for field in f.get("fields") or []:
+            ph = field.get("placeholder") or ""
+            if ph:
+                known.add(ph.casefold())
+            ob = field.get("opened_by") or ""
+            if ob:
+                known.add(ob.casefold())
+        roles = f.get("roles") or {}
+        for k in role_totals:
+            try:
+                role_totals[k] += int(roles.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+    issues = []
+    for m in _ROLE_NAME_RE.finditer(code):
+        role = (m.group(1) or m.group(3) or "").lower()
+        name = m.group(2) or m.group(4) or ""
+        if not name:
+            continue
+        if re.search(r"(?i)sign\s*in\s*signing", name):
+            issues.append(f'button name={name!r} looks like a loading-state concat — use "Sign In"')
+            continue
+        key = name.casefold()
+        if known and key not in known:
+            # Playwright name matching is substring-ish toward the accessible
+            # name, so "library" can match "From library". The reverse is how
+            # the model invents failures: "Select from library" when only
+            # "From library" exists — reject that direction.
+            if not any(key == k or key in k for k in known):
+                issues.append(f'{role} name={name!r} is not in clickable/buttons — '
+                              f'use a verbatim label from the crawl')
+    for m in _ROLE_BARE_RE.finditer(code):
+        role = (m.group(1) or m.group(2) or "").lower()
+        if role_totals.get(role, 0) == 0 and (context_flows or []):
+            issues.append(f'get_by_role("{role}") used but crawled pages have '
+                          f'0 {role}s — pick a real button/placeholder instead')
+    # bare get_by_role(...).click() without .first/.nth → strict-mode landmine
+    for m in _STRICT_CLICK_RE.finditer(code):
+        chunk = m.group(0)
+        if not re.search(r"\.(first|nth|last)\s*\(", chunk):
+            issues.append("get_by_*().click/fill without .first/.nth — "
+                          "add .first to avoid strict-mode double matches")
+            break
+    if re.search(r'goto\([^)]*login', code, re.I) and re.search(r'goto\(\s*BASE', code):
+        issues.append("flow embeds its own /login — hosted runs already sign in; "
+                      "start at the feature URL instead")
+    return issues
+
+
+def _nl_context_payload(context_flows):
+    return [{"title": f.get("title"), "url": f.get("url"), "type": f.get("type"),
+             "fields": [{"name": x.get("name"), "placeholder": x.get("placeholder"),
+                         "type": x.get("type"),
+                         "visible": x.get("visible", True),
+                         "opened_by": x.get("opened_by", "")}
+                        for x in f.get("fields", [])],
+             "clickable": f.get("labels") or f.get("clickable") or [],
+             "buttons": f.get("buttons") or [],
+             "roles": f.get("roles") or {}}
+            for f in (context_flows or [])]
 
 
 def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, timeout=150,
@@ -2814,32 +3416,53 @@ def nl_flow(prompt, context_flows, base, lang, api_key, model=DEFAULT_AI_MODEL, 
     """Turn a plain-English description into a runnable flow, grounded in the crawled
     pages. `var_names` are project variables the model should reference as {{NAME}}.
     Returns a flow dict with a verbatim `code` body (for scaffold_script), or None on
-    failure. BYO-key; never raises."""
-    ctx = [{"title": f.get("title"), "url": f.get("url"), "type": f.get("type"),
-            "fields": [{"name": x.get("name"), "placeholder": x.get("placeholder"),
-                        "type": x.get("type"),
-                        # False => hidden until something opens it (a modal)
-                        "visible": x.get("visible", True),
-                        "opened_by": x.get("opened_by", "")}
-                       for x in f.get("fields", [])],
-            # the clickable text that actually exists on this page
-            "clickable": f.get("labels", [])}
-           for f in (context_flows or [])]
+    failure. BYO-key; never raises.
+
+    After the first draft, lint against crawled clickables/roles and give the model
+    one repair pass — catches invented 'Select from library' / checkbox clicks before
+    they ship as a broken scenario."""
+    ctx = _nl_context_payload(context_flows)
     payload = {"description": prompt, "language": ("python" if lang == "py" else "javascript"),
                "base_url": base, "known_pages": ctx}
     if var_names:
         payload["variables"] = list(var_names)
-    body = {"model": model, "max_tokens": 800,
-            "system": [{"type": "text", "text": NL_FLOW_SYSTEM, "cache_control": {"type": "ephemeral"}}],
-            "messages": [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            "output_config": {"format": {"type": "json_schema", "schema": NL_FLOW_SCHEMA}}}
-    try:
+
+    def _ask(user_payload):
+        body = {"model": model, "max_tokens": 800,
+                "system": [{"type": "text", "text": NL_FLOW_SYSTEM,
+                            "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user",
+                              "content": json.dumps(user_payload, ensure_ascii=False)}],
+                "output_config": {"format": {"type": "json_schema", "schema": NL_FLOW_SCHEMA}}}
         resp = _anthropic_messages(body, api_key, timeout=timeout)
-        text = next((b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"), "")
+        text = next((b.get("text", "") for b in resp.get("content", [])
+                     if b.get("type") == "text"), "")
         obj = json.loads(text) if text else {}
         code = normalize_flow_code((obj.get("code") or "").strip(), lang)
+        return obj, code
+
+    try:
+        obj, code = _ask(payload)
         if not code:
             return None
+        issues = lint_flow_against_context(code, context_flows)
+        if issues:
+            repair = dict(payload)
+            repair["lint_errors"] = issues
+            repair["draft_code"] = code
+            repair["fix_instruction"] = (
+                "The draft fails grounding checks. Rewrite the code so every "
+                "get_by_role name appears verbatim in known_pages clickable/buttons, "
+                "and do not use checkbox/option when roles counts are 0. Prefer "
+                "existing CTAs like 'Add all' / 'From library' / 'Pick an Audience'.")
+            obj2, code2 = _ask(repair)
+            if code2:
+                issues2 = lint_flow_against_context(code2, context_flows)
+                if len(issues2) <= len(issues):
+                    obj, code, issues = obj2, code2, issues2
+            if issues:
+                sys.stderr.write("nl_flow: still ungrounded after repair — "
+                                 + "; ".join(issues[:3]) + "\n")
         return {"title": obj.get("title") or prompt[:48], "type": "custom",
                 "url": base, "heading": "", "fields": [], "code": code, "nl": True}
     except Exception as e:
@@ -3288,6 +3911,11 @@ def main():
                          "tts-1 is cheaper, tts-1-hd higher fidelity)")
     ap.add_argument("--tts-key", default=None,
                     help="OpenAI API key for --voice (else read from OPENAI_API_KEY)")
+    ap.add_argument("--tts-instructions", default=None, metavar="TEXT",
+                    help="delivery notes for the voiceover narrator (gpt- TTS models "
+                         "only, e.g. 'upbeat, brisk'); or tts_instructions: in "
+                         "specreel.yml. Clips cache in ~/.cache/specreel/tts — "
+                         "override with SPECREEL_TTS_CACHE=<dir>, disable with =off")
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero if any flow's first/last step wasn't captured "
                          "(a truncated demo — for CI, like a failing test)")
@@ -3297,6 +3925,10 @@ def main():
                          "low=one still per step & smallest). Or quality: in specreel.yml")
     ap.add_argument("--gif", action="store_true",
                     help="also export demo.gif (needs ffmpeg) — for READMEs and PRs")
+    ap.add_argument("--showcase", action="store_true",
+                    help="also emit showcase/ — a curated, customer-facing gallery "
+                         "containing only flows marked public: true that are passing "
+                         "(or showcase: true in specreel.yml; batch mode)")
     args = ap.parse_args()
 
     if os.path.isdir(args.trace):
@@ -3306,8 +3938,11 @@ def main():
                                   bundle=args.bundle, theme=args.theme,
                                   notify=args.notify, public_url=args.url,
                                   voice=args.voice, tts_model=args.tts_model,
-                                  tts_key=args.tts_key, strict=args.strict,
-                                  quality=args.quality, want_gif=args.gif))
+                                  tts_key=args.tts_key,
+                                  tts_instructions=args.tts_instructions,
+                                  strict=args.strict,
+                                  quality=args.quality, want_gif=args.gif,
+                                  showcase=args.showcase))
 
     api_key = resolve_api_key(args.api_key)
     if args.ai and not api_key:
@@ -3322,9 +3957,78 @@ def main():
                           ai=args.ai, api_key=api_key, ai_model=args.ai_model,
                           theme=args.theme or "dark", voice=voice,
                           tts_model=args.tts_model, tts_key=tts_key,
+                          tts_instructions=args.tts_instructions,
                           quality=args.quality or DEFAULT_QUALITY, want_gif=args.gif)
     if args.strict and stats.get("capture", {}).get("issues"):
         sys.exit(1)
+
+
+# Shared player narration engine, injected as __TTSJS__ into HTML_TEMPLATE and
+# BUNDLE_TEMPLATE (they had drifted apart as two copies). Expects the host script
+# to define STEPS, cur, timer and the #tts / #voice controls; provides tts state,
+# _sched (autoplay pacing that waits for narration), playStep and speak.
+TTS_JS = r"""let tts=false,_ttsAuto=true,_voice=null;
+function _clipMs(s){return (s&&s.imgs&&s.imgs.length>1)?s.dts.reduce((a,b)=>a+b,0):0;}
+function _hasVO(){try{return STEPS.some(s=>s&&s.audio);}catch(e){return false;}}
+/* prefer a natural/neural browser voice over the robotic system default */
+function _vscore(v){var n=(v.name||'').toLowerCase();if(!/^en(-|_|\b|$)/i.test(v.lang||''))return -1;var s=0;
+if(/natural|neural/.test(n))s+=10;if(/siri/.test(n))s+=9;if(/google/.test(n))s+=6;
+if(/premium|enhanced/.test(n))s+=5;if(/(samantha|aria|jenny|guy|ava|allison|emma|nova|zira|libby|sonia)/.test(n))s+=3;
+if(/en-us/i.test(v.lang||''))s+=2;if(v.localService===false)s+=1;
+if(/zarvox|albert|bells|cellos|trinoids|whisper|bad news|good news|boing|bahh|bubbles|wobble|deranged|hysterical|fred|junior|ralph|kathy|organ|e-?speak|compact|novelty/.test(n))s-=20;
+return s;}
+function _vsorted(){try{var vs=(speechSynthesis.getVoices()||[]).filter(function(v){return _vscore(v)>-1;});vs.sort(function(a,b){return _vscore(b)-_vscore(a);});return vs;}catch(e){return [];}}
+function _fillVoices(){try{var sel=document.getElementById('voice'),vs=_vsorted();
+if(!sel)return;
+/* with studio narration the browser-voice picker is noise — hide it */
+sel.style.display=(_hasVO()||!vs.length)?'none':'';
+if(!vs.length)return;
+var want=null;try{want=localStorage.getItem('specreel-voice');}catch(e){}
+if(want){for(var i=0;i<vs.length;i++)if(vs[i].name===want){_voice=vs[i];break;}}
+if(!_voice)_voice=vs[0];
+sel.innerHTML='';vs.forEach(function(v){var o=document.createElement('option');o.value=v.name;o.textContent=v.name.replace(/\s*\(.*\)$/,'').slice(0,26);if(_voice&&v.name===_voice.name)o.selected=true;sel.appendChild(o);});
+sel.onchange=function(){for(var i=0;i<vs.length;i++){if(vs[i].name===sel.value){_voice=vs[i];break;}}try{localStorage.setItem('specreel-voice',sel.value);}catch(e){}if(tts)playStep(cur);};}catch(e){}}
+var _au=(window.Audio?new Audio():null),_next=null,_gen=0;
+function _fire(g){if(g!=null&&g!==_gen)return;clearTimeout(timer);var f=_next;_next=null;if(f)f();}
+if(_au)_au.onended=function(){var g=_gen;setTimeout(function(){_fire(g);},280);};
+/* What the voice SAYS: the caption plus failure wording a listener can't see,
+   with masked secrets (•••) and url schemes translated for the ear. */
+function _spk(s){var t=(s&&s.caption)||'';
+if(s&&s.failed)t='This step failed: '+t+(s.why?('. '+s.why):'');
+return t.replace(/•+/g,'the hidden value').replace(/https?:\/\//g,'').replace(/\s+/g,' ');}
+/* Autoplay without TTS uses step.dur (~1.4s). With TTS on, that cuts mid-sentence —
+   wait for studio audio / utterance.onend, with a text-length fallback so a stuck
+   speechSynthesis can't freeze the demo. */
+function _speakMs(s){return Math.max(((s&&s.dur)||1.4)*1000,_clipMs(s||{})+700,900+_spk(s).length*58);}
+function _sched(fn){var s=STEPS[cur];clearTimeout(timer);
+var hold=Math.max(((s&&s.dur)||1.4)*1000,_clipMs(s||{})+700);
+/* Last step: dwell a beat longer so the climax isn't covered by the outro. */
+if(cur>=STEPS.length-1)hold+=1400;
+if(tts){_next=fn;var g=_gen;timer=setTimeout(function(){if(_next===fn&&g===_gen){_next=null;fn();}},Math.min(Math.max(_speakMs(s),hold)+5000,30000));}
+else{_next=null;timer=setTimeout(fn,hold);}}
+function playStep(i){_gen++;try{if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();}catch(e){}
+_updTTS();if(!tts)return;var s=STEPS[i];if(!s)return;
+if(s.audio&&_au){try{_au.src=s.audio;var p=_au.play();if(p&&p.catch)p.catch(function(){speak(_spk(s));});}catch(e){speak(_spk(s));}}else{speak(_spk(s));}}
+function speak(t){if(!tts||!window.speechSynthesis)return;try{speechSynthesis.cancel();if(!_voice)_voice=_vsorted()[0]||null;
+var g=_gen,u=new SpeechSynthesisUtterance(t);if(_voice){u.voice=_voice;u.lang=_voice.lang;}u.rate=0.97;u.pitch=1.0;
+u.onend=function(){setTimeout(function(){_fire(g);},280);};u.onerror=function(){_fire(g);};
+/* Chrome can drop an utterance queued synchronously after cancel() — breathe first */
+setTimeout(function(){if(g!==_gen||!tts)return;try{speechSynthesis.speak(u);}catch(e){_fire(g);}},60);}catch(e){_fire(_gen);}}
+/* Paid studio narration announces itself on the toggle; the free voice is On/Off */
+function _updTTS(){var b=document.getElementById('tts');if(!b)return;
+b.textContent=tts?(_hasVO()?'🔊 Voiceover':'🔊 On'):'🔊 Off';
+b.title=_hasVO()?'Studio voiceover narration':'Read steps aloud';}
+/* A demo built with studio voiceover defaults to sound ON (it still only starts on
+   the viewer's Play click); a stored viewer preference always wins. */
+function _initTTS(){var st=null;try{st=localStorage.getItem('specreel-tts');}catch(e){}
+if(st==='1'||st==='0'){tts=(st==='1');_ttsAuto=false;}
+else if(_ttsAuto)tts=_hasVO();
+_updTTS();_fillVoices();}
+(function(){var b=document.getElementById('tts');if(!b)return;
+b.onclick=function(){tts=!tts;_ttsAuto=false;try{localStorage.setItem('specreel-tts',tts?'1':'0');}catch(e){}
+_updTTS();if(tts){playStep(cur);}else{try{if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();}catch(e){}}};})();
+if(window.speechSynthesis)speechSynthesis.onvoiceschanged=function(){_fillVoices();};
+_initTTS();"""
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
@@ -3453,32 +4157,11 @@ document.getElementById('ostat').className='ostat'+(bad?' fail':'');
 document.getElementById('otitle').textContent=bad?'This flow is currently failing':'Flow verified';
 document.getElementById('osub').textContent=(bad?'A step failed on the last run':'Generated from a passing test')+' · __DATE__';
 outro.classList.remove('hidden');}
-function stop(){playing=false;clearTimeout(timer);_next=null;if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();document.getElementById('play').textContent='▶ Play';}
-let tts=false,_voice=null;
-/* prefer a natural/neural browser voice over the robotic system default */
-function _vscore(v){var n=(v.name||'').toLowerCase();if(!/^en(-|_|\b|$)/i.test(v.lang||''))return -1;var s=0;
-if(/natural|neural/.test(n))s+=10;if(/siri/.test(n))s+=9;if(/google/.test(n))s+=6;
-if(/premium|enhanced/.test(n))s+=5;if(/(samantha|aria|jenny|guy|ava|allison|emma|nova|zira|libby|sonia)/.test(n))s+=3;
-if(/en-us/i.test(v.lang||''))s+=2;if(v.localService===false)s+=1;
-if(/zarvox|albert|bells|cellos|trinoids|whisper|bad news|good news|boing|bahh|bubbles|wobble|deranged|hysterical|fred|junior|ralph|kathy|organ|e-?speak|compact|novelty/.test(n))s-=20;
-return s;}
-function _vsorted(){try{var vs=(speechSynthesis.getVoices()||[]).filter(function(v){return _vscore(v)>-1;});vs.sort(function(a,b){return _vscore(b)-_vscore(a);});return vs;}catch(e){return [];}}
-function _fillVoices(){try{var sel=document.getElementById('voice'),vs=_vsorted();
-if(!vs.length){if(sel)sel.style.display='none';return;}
-if(!_voice)_voice=vs[0];
-if(sel){sel.innerHTML='';vs.forEach(function(v){var o=document.createElement('option');o.value=v.name;o.textContent=v.name.replace(/\s*\(.*\)$/,'').slice(0,26);if(_voice&&v.name===_voice.name)o.selected=true;sel.appendChild(o);});
-sel.onchange=function(){for(var i=0;i<vs.length;i++){if(vs[i].name===sel.value){_voice=vs[i];break;}}if(tts)playStep(cur);};}}catch(e){}}
-var _au=(window.Audio?new Audio():null),_next=null;
-if(_au)_au.onended=function(){clearTimeout(timer);var f=_next;_next=null;if(f)f();};
-function _sched(fn){var s=STEPS[cur];if(tts&&_au&&s&&s.audio){_next=fn;clearTimeout(timer);timer=setTimeout(function(){if(_next===fn){_next=null;fn();}},9000);}else{_next=null;timer=setTimeout(fn,Math.max(((s&&s.dur)||1.4)*1000,clipMs(s||{})+700));}}
-function playStep(i){try{if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();}catch(e){}if(!tts)return;var a=STEPS[i]&&STEPS[i].audio;if(a&&_au){try{_au.src=a;var p=_au.play();if(p&&p.catch)p.catch(function(){speak(STEPS[i].caption);});}catch(e){speak(STEPS[i].caption);}}else{speak(STEPS[i].caption);}}
-function speak(t){if(!tts||!window.speechSynthesis)return;try{speechSynthesis.cancel();if(!_voice)_voice=_vsorted()[0]||null;
-var u=new SpeechSynthesisUtterance(t);if(_voice){u.voice=_voice;u.lang=_voice.lang;}u.rate=0.97;u.pitch=1.0;speechSynthesis.speak(u);}catch(e){}}
-if(window.speechSynthesis){_fillVoices();speechSynthesis.onvoiceschanged=function(){_fillVoices();};}
+function stop(){playing=false;clearTimeout(timer);_next=null;_gen++;if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();document.getElementById('play').textContent='▶ Play';}
+__TTSJS__
 document.getElementById('next').onclick=()=>{stop();next();};
 document.getElementById('prev').onclick=()=>{stop();if(cur>0)show(cur-1);};
 document.getElementById('play').onclick=play;
-const _ttsb=document.getElementById('tts');_ttsb.onclick=()=>{tts=!tts;_ttsb.textContent=tts?'🔊 On':'🔊 Off';if(!tts){if(window.speechSynthesis)speechSynthesis.cancel();}else{playStep(cur);}};
 document.onkeydown=e=>{if(e.key==='ArrowRight'){stop();next();}if(e.key==='ArrowLeft'){stop();if(cur>0)show(cur-1);}if(e.key===' '){e.preventDefault();play();}};
 document.getElementById('ibtn').onclick=play;
 document.getElementById('iskip').onclick=()=>intro.classList.add('hidden');
@@ -3635,6 +4318,87 @@ __CARDS__
 </body></html>"""
 
 
+# The curated, customer-facing gallery (out/showcase/): passing public flows only.
+# No health stats, no test jargon — but provenance (build + verify date) stays:
+# "these demos are re-verified every release" is the pitch, in the customer's brand.
+SHOWCASE_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+__OG__
+<title>__HEADLINE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+__THEMEVARS__
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14px;
+background-image:radial-gradient(900px 500px at 85% -10%,var(--green-dim),transparent 60%);
+min-height:100vh;padding:22px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto}
+.top{display:flex;align-items:center;justify-content:space-between;padding-bottom:18px;border-bottom:1px solid var(--line);margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:10px}
+.plogo{height:26px;width:auto;display:block}
+.pname{font-family:var(--serif);font-size:24px;line-height:1}
+.logo{font-family:var(--serif);font-size:30px;line-height:1;color:var(--text)}
+.logo .dot{color:var(--green)}
+.build{display:inline-flex;align-items:center;gap:7px;color:var(--green);font-size:11.5px}
+.pulse{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2.2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(95,241,155,.5)}70%{box-shadow:0 0 0 7px rgba(95,241,155,0)}100%{box-shadow:0 0 0 0 rgba(95,241,155,0)}}
+.hero{margin-bottom:20px}
+.kicker{color:var(--green);font-size:11px;text-transform:uppercase;letter-spacing:1.6px;margin-bottom:8px}
+.hero h1{font-family:var(--serif);font-weight:400;font-size:34px;line-height:1.1}
+.hero p{color:var(--muted);font-size:12.5px;margin-top:7px;max-width:620px}
+.toolbar{display:flex;gap:9px;align-items:center;margin:20px 0 16px}
+.toolbar input{flex:1;min-width:200px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 13px;color:var(--text);font-family:inherit;font-size:13px}
+.toolbar input:focus{outline:none;border-color:var(--green)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.card{display:block;text-decoration:none;color:var(--text);background:var(--panel);
+border:1px solid var(--line);border-radius:12px;overflow:hidden;transition:.15s}
+.card:hover{border-color:var(--green);transform:translateY(-2px)}
+.thumb{height:150px;background:#0a0b0d;background-size:cover;background-position:top center;border-bottom:1px solid var(--line-soft)}
+.thumb.empty{display:flex;align-items:center;justify-content:center}
+.cbody{padding:13px 15px}
+.ct{font-size:13.5px;font-weight:500;line-height:1.3}
+.cmeta{display:flex;align-items:center;justify-content:space-between;margin-top:9px;font-size:11px}
+.cmeta .dur{color:var(--muted)}.cmeta .ok{color:var(--green)}
+.card.hide{display:none}
+.nomatch{display:none;color:var(--faint);font-size:13px;padding:26px 2px}
+.foot{display:flex;align-items:center;justify-content:space-between;margin-top:22px;padding-top:16px;border-top:1px solid var(--line);color:var(--faint);font-size:11px}
+@media(max-width:880px){.hero h1{font-size:27px}}
+__ACCENT__
+__CUSTOMCSS__
+</style>__ANALYTICS__</head><body><div class="wrap">
+<div class="top">
+<div class="brand">__BRAND__</div>
+<div>__PROOF__</div>
+</div>
+<div class="hero"><div class="kicker">__KICKER__</div><h1>__HEADLINE__</h1>
+<p>__TAGLINE__</p></div>
+<div class="toolbar"><input id="q" type="search" placeholder="Search demos…" autocomplete="off"></div>
+<div class="grid" id="grid">
+__CARDS__
+</div>
+<div class="nomatch" id="nomatch">No demos match.</div>
+<div class="foot"><span>__COUNT__ · each generated from a real, passing product flow</span>
+<span>verified __DATE__</span></div>
+</div>
+<script>
+(function(){
+  var q=document.getElementById('q'), grid=document.getElementById('grid'),
+      cards=[].slice.call(grid.querySelectorAll('.card')),
+      nomatch=document.getElementById('nomatch');
+  q.addEventListener('input',function(){
+    var term=(q.value||'').trim().toLowerCase(), shown=0;
+    cards.forEach(function(c){
+      var ok=!term||(c.getAttribute('data-title')||'').indexOf(term)>=0;
+      c.classList.toggle('hide',!ok); if(ok)shown++;
+    });
+    nomatch.style.display=shown?'none':'block';
+  });
+})();
+</script>
+</body></html>"""
+
+
 # One self-contained file: gallery + every flow's player, all data inlined, hash-routed.
 BUNDLE_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3773,34 +4537,13 @@ prog.style.width=((i+1)/STEPS.length*100)+'%';counter.textContent=(i+1)+' / '+ST
 function next(){if(cur<STEPS.length-1)show(cur+1);else stop();}
 function adv(){next();if(playing&&cur<STEPS.length-1)_sched(adv);else if(playing)stop();}
 function play(){if(playing){stop();return;}playing=true;el('play').textContent='❚❚ Pause';if(cur>=STEPS.length-1)show(0);else playStep(cur);_sched(adv);}
-function stop(){playing=false;clearTimeout(timer);_next=null;if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();el('play').textContent='▶ Play';}
-let tts=false,_voice=null;
-/* prefer a natural/neural browser voice over the robotic system default */
-function _vscore(v){var n=(v.name||'').toLowerCase();if(!/^en(-|_|\b|$)/i.test(v.lang||''))return -1;var s=0;
-if(/natural|neural/.test(n))s+=10;if(/siri/.test(n))s+=9;if(/google/.test(n))s+=6;
-if(/premium|enhanced/.test(n))s+=5;if(/(samantha|aria|jenny|guy|ava|allison|emma|nova|zira|libby|sonia)/.test(n))s+=3;
-if(/en-us/i.test(v.lang||''))s+=2;if(v.localService===false)s+=1;
-if(/zarvox|albert|bells|cellos|trinoids|whisper|bad news|good news|boing|bahh|bubbles|wobble|deranged|hysterical|fred|junior|ralph|kathy|organ|e-?speak|compact|novelty/.test(n))s-=20;
-return s;}
-function _vsorted(){try{var vs=(speechSynthesis.getVoices()||[]).filter(function(v){return _vscore(v)>-1;});vs.sort(function(a,b){return _vscore(b)-_vscore(a);});return vs;}catch(e){return [];}}
-function _fillVoices(){try{var sel=document.getElementById('voice'),vs=_vsorted();
-if(!vs.length){if(sel)sel.style.display='none';return;}
-if(!_voice)_voice=vs[0];
-if(sel){sel.innerHTML='';vs.forEach(function(v){var o=document.createElement('option');o.value=v.name;o.textContent=v.name.replace(/\s*\(.*\)$/,'').slice(0,26);if(_voice&&v.name===_voice.name)o.selected=true;sel.appendChild(o);});
-sel.onchange=function(){for(var i=0;i<vs.length;i++){if(vs[i].name===sel.value){_voice=vs[i];break;}}if(tts)playStep(cur);};}}catch(e){}}
-var _au=(window.Audio?new Audio():null),_next=null;
-if(_au)_au.onended=function(){clearTimeout(timer);var f=_next;_next=null;if(f)f();};
-function _sched(fn){var s=STEPS[cur];if(tts&&_au&&s&&s.audio){_next=fn;clearTimeout(timer);timer=setTimeout(function(){if(_next===fn){_next=null;fn();}},9000);}else{_next=null;timer=setTimeout(fn,((s&&s.dur)||1.4)*1000);}}
-function playStep(i){try{if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();}catch(e){}if(!tts)return;var a=STEPS[i]&&STEPS[i].audio;if(a&&_au){try{_au.src=a;var p=_au.play();if(p&&p.catch)p.catch(function(){speak(STEPS[i].caption);});}catch(e){speak(STEPS[i].caption);}}else{speak(STEPS[i].caption);}}
-function speak(t){if(!tts||!window.speechSynthesis)return;try{speechSynthesis.cancel();if(!_voice)_voice=_vsorted()[0]||null;
-var u=new SpeechSynthesisUtterance(t);if(_voice){u.voice=_voice;u.lang=_voice.lang;}u.rate=0.97;u.pitch=1.0;speechSynthesis.speak(u);}catch(e){}}
-if(window.speechSynthesis){_fillVoices();speechSynthesis.onvoiceschanged=function(){_fillVoices();};}
+function stop(){playing=false;clearTimeout(timer);_next=null;_gen++;if(_au)_au.pause();if(window.speechSynthesis)speechSynthesis.cancel();el('play').textContent='▶ Play';}
+__TTSJS__
 el('next').onclick=()=>{stop();next();};el('prev').onclick=()=>{stop();if(cur>0)show(cur-1);};
 el('play').onclick=()=>{if(touring){touring=false;stop();return;}play();};
 el('back').onclick=()=>{location.hash='';};
-el('tts').onclick=()=>{tts=!tts;el('tts').textContent=tts?'🔊 On':'🔊 Off';if(!tts){if(window.speechSynthesis)speechSynthesis.cancel();}else{playStep(cur);}};
 document.onkeydown=e=>{if(el('player').classList.contains('on')){if(e.key==='ArrowRight'){stop();next();}if(e.key==='ArrowLeft'){stop();if(cur>0)show(cur-1);}if(e.key===' '){e.preventDefault();play();}if(e.key==='Escape')location.hash='';}};
-function openFlow(f){stop();STEPS=f.steps||[];cur=0;el('ptitle').textContent=f.title;buildList();if(STEPS.length)show(0);
+function openFlow(f){stop();STEPS=f.steps||[];cur=0;_initTTS();el('ptitle').textContent=f.title;buildList();if(STEPS.length)show(0);
 el('gallery').classList.remove('on');el('player').classList.add('on');window.scrollTo(0,0);}
 // Play-all tour: chain every flow's player back-to-back (chaptering).
 function tourSchedule(){clearTimeout(timer);_sched(tourTick);}
