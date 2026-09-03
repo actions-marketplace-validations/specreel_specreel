@@ -12,6 +12,10 @@ stale.** When it would, a test fails instead.
 > A demo and an end-to-end test are the same artifact: a recorded browser flow.
 > Record/prompt once → replay = demo, share = send, assert = test.
 
+![A Specreel demo: a sign-up flow replayed with captions, generated from a passing test](assets/demo.gif)
+
+<sub>↑ produced by `specreel trace.zip -o out/ --gif` — nothing scripted, that's a real test run.</sub>
+
 Captions are deterministic by default (no AI, no network). AI narration is
 opt-in + BYO-key. Runtime is stdlib-only (Pillow only for `--mp4`); it's one file.
 
@@ -81,6 +85,11 @@ language-agnostic.
   `manifest.json`; a flow that changed but still passes gets an amber `⟳ updated`
   badge (the UI moved, the test stayed green, the demo refreshed).
 - **`gallery.html`** is a single self-contained file — email it, or host it anywhere.
+- **Showcase** (`--showcase` or `showcase: true`): a second, **customer-facing**
+  render at `site/showcase/` — only flows marked `public: true` that are passing, no
+  failure states, brandable (`showcase_*` keys), with a "verified · build · date"
+  provenance badge. Excluded flows are *absent from the directory*, not hidden —
+  share `/showcase/` and the internal view never reaches customers.
 - **Themes:** `--theme dark|light` (or `theme:` in config).
 
 ## AI narration
@@ -104,6 +113,7 @@ product_name: My App        # AI narration says this, not localhost URLs
 theme: dark                 # dark | light
 ai: false                   # true (+ key) to narrate
 bundle: false               # true to also emit gallery.html
+showcase: false             # true to also emit showcase/ (curated, customer-facing)
 setup_urls: [/login]        # leading nav steps to drop from every demo
 flows:
   signup: { title: Sign up, public: true }
@@ -144,7 +154,7 @@ requests — so the demo can't be older than the last passing build. See
 | `specreel publish <site> --to ghpages\|dir:<p>` | Deploy a gallery to a URL. |
 | `specreel summary <site>` | Markdown build summary (for PR comments / CI). |
 
-Key flags: `--bundle --ai [--ai-model M] --theme dark|light --mp4 --notify <url> --config f --strict`.
+Key flags: `--bundle --ai [--ai-model M] --theme dark|light --mp4 --notify <url> --config f --strict --quality --gif`.
 Full reference: [docs/cli-reference.md](docs/cli-reference.md).
 
 ## Docs & more

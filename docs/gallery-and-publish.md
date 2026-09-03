@@ -37,6 +37,62 @@ On each build, Specreel diffs every flow's step signature against the previous
 `⟳ updated` badge — the UI moved, the test stayed green, the demo refreshed. A CI
 self-healing step can also force it via `healed: true` in [config](configuration.md).
 
+## Customer-facing showcase
+One build serves two audiences. The gallery above is the **engineering view**: every
+flow, failures front and center, build metadata — a health dashboard. `--showcase`
+(or `showcase: true` in [config](configuration.md)) additionally emits
+`site/showcase/`, the **customer view**: only flows marked `public: true` that are
+**passing**, with no failure states or test jargon — just titled demos, a search box,
+and the one thing worth keeping from CI: a *"verified · build N · date"* provenance
+badge, because "re-verified on every release" is the pitch.
+
+```bash
+specreel test-results/ -o site/ --showcase
+#   site/index.html            <- full gallery (internal)
+#   site/showcase/index.html   <- curated gallery (customer-facing)
+```
+
+Why a separate directory instead of a filter? The players **embed their frames** —
+a failing or internal flow "hidden" with CSS in a shared page would still ship its
+video bytes, flow names, and error captions to anyone who views source. Curation
+happens at generation time: what's excluded is *absent*, not unlinked. For the same
+reason the showcase directory is rebuilt from scratch each time — a flow that was
+public last build but is failing or private now doesn't linger.
+
+Semantics:
+- A **failing public flow is dropped** for that build (the CLI says so). If *no*
+  public flow passes, no showcase is emitted at all.
+- `site/showcase/manifest.json` lists only what's shown, with no health fields.
+- With `bundle: true`, the showcase also gets its own curated `gallery.html`.
+- The top-level `manifest.json` gains `"showcase": true` so tooling (and Specreel
+  Cloud) knows the build carries one.
+
+Brand it with the `showcase_*` keys ([configuration](configuration.md)): headline,
+tagline, accent color, an embedded logo, or a raw CSS file for full control.
+
+### Set it up — pick your path
+
+**Open-source CLI (static hosting, you control the URLs):**
+1. In `specreel.yml`, set `showcase: true` and mark the customer-ready flows
+   `public: true`.
+2. Render: `specreel test-results/ -o site/` — the curated render lands in
+   `site/showcase/`.
+3. Share it, either way:
+   - *Two URLs from one publish* — `specreel publish site/ --to ghpages` serves the
+     full gallery at `/` and the curated one at `/showcase/`; share the latter.
+   - *Public host gets the showcase only* —
+     `specreel publish site/showcase --to dir:/var/www/demos`, so the internal view
+     never leaves CI.
+
+**Specreel Cloud (one URL, membership does the gating):**
+1. Same config — `showcase: true` + `public: true` flows. Hosted runs honor your
+   `specreel.yml`; CLI publishes carry the showcase automatically.
+2. Publish (`--to cloud`) or let a scheduled run do it.
+3. Project page → **Public gallery view → showcase**. Visitors at
+   `/g/<org>/<project>/` now get only the curated render; org members keep the full
+   gallery at the same URL. Details:
+   [cloud](cloud.md#customer-facing-showcase-public-gallery-view).
+
 ## Publishing
 Deploy a generated gallery to a real URL and get an `<iframe>` embed snippet:
 

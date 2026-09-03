@@ -18,14 +18,17 @@ and suggests demo-worthy flows. On the **refine** screen you can:
 - **Refine the set in English** — "focus on checkout, drop the marketing pages" →
   AI reorders/renames/drops (never invents).
 
-Then it scaffolds the Playwright script and creates a monitored project, with a
-**setup screen** (scaffold + a scheduled GitHub Action + the two repo secrets), or run
-it via **hosted runs**. It's a smoke-level starting set you refine. The plain-English
-features need `SPECREEL_CLOUD_AI_KEY` on the server (BYO-key); private/internal URLs
-are refused.
+Then it creates the project and asks **how the flows should run**:
+- **Run in Specreel** — edit scenarios here; hosted runs replay them (no GitHub).
+- **Add to CI** — commit a scaffold + `specreel-monitor.yml` + two repo secrets
+  (the engineering path).
+- **I'll do it myself** — skip; publish from the CLI or come back later.
+
+It's a smoke-level starting set you refine. The plain-English features need
+`SPECREEL_CLOUD_AI_KEY` on the server (BYO-key); private/internal URLs are refused.
 
 **② From an existing suite.** Create an API token and `publish --to cloud` (below).
-Any project's **Set up schedule** button regenerates the monitor workflow any time.
+Any project's **CI schedule** button regenerates the monitor workflow any time.
 
 ## Publish from the CLI
 ```bash
@@ -46,6 +49,34 @@ specreel publish site --to cloud --project my-app \
 - **Monitoring + break alerts** — the cloud watches every publish and alerts when a
   flow breaks. See below.
 - **Review & sign-off** — comments, build approval, and login-free review links.
+- **Narrated captions, no key needed** — hosted runs narrate your steps into friendly
+  prose automatically (the literal caption stays underneath as the source of truth).
+  With the CLI you'd bring your own key via `--ai`; hosted, it's included.
+- **Your branding** — set an accent color and logo per project (Project settings →
+  Branding) and every hosted demo picks them up immediately, no republish.
+- **A customer-facing showcase** — serve visitors the curated render while your team
+  keeps the full health view. See below.
+
+## Customer-facing showcase (Public gallery view)
+One project, two audiences. Builds published with `showcase: true` in `specreel.yml`
+carry a curated `showcase/` render — only flows marked `public: true` that are
+passing, no failure states, provenance kept (see
+[gallery & publishing](gallery-and-publish.md#customer-facing-showcase)). To make
+that what the world sees:
+
+1. Publish a build made with `showcase: true` (CLI or hosted runs — the runner
+   honors your `specreel.yml`).
+2. On the project page, set **Public gallery view → showcase** (admin-only).
+
+From then on, non-members visiting `/g/<org>/<project>/` are **confined to the
+curated render** — internal and failing flow files aren't merely unlinked, they
+aren't fetchable at that URL at all. Org members always see the full gallery at the
+same address, and review links (`/r/<token>`) stay full-view too: reviewers are the
+audience failures *are* for. If the live build doesn't carry a showcase yet,
+visitors get a friendly pending page instead of a leak.
+
+The default (**full**) keeps today's behavior: the share URL serves the complete
+gallery, failures included.
 
 ## Monitoring & break alerts (feature A)
 
@@ -115,6 +146,10 @@ folders — on `/app/projects/<id>/scenarios`:
 - **Add a scenario in English** ("Log in with `{{EMAIL}}` / `{{PASSWORD}}`, then verify
   the dashboard shows 'Your Sites'") → we generate a runnable flow, grounded in the
   app's pages. Bulk-add one per line; edit re-generates; pause to mute a flaky one.
+- **Discover scenarios** re-runs the onboarding crawl against the project's target
+  URL (signed in, if the project has stored sign-in) and offers only the flows your
+  scenarios don't already cover — so coverage can grow as the app does, not just at
+  onboarding.
 - **Variables** are project-level (`{{NAME}}`), optionally **secret** (masked) —
   reusable test data and the clean way to handle logins. They're injected into every
   scenario at run time.

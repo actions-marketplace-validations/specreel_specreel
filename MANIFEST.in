@@ -4,6 +4,7 @@
 # only, NOT the sdist).
 include LICENSE
 include README.md
+include CHANGELOG.md
 include specreel.py
 include specreel_mcp.py
 prune cloud
