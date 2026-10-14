@@ -146,6 +146,14 @@ folders — on `/app/projects/<id>/scenarios`:
 - **Add a scenario in English** ("Log in with `{{EMAIL}}` / `{{PASSWORD}}`, then verify
   the dashboard shows 'Your Sites'") → we generate a runnable flow, grounded in the
   app's pages. Bulk-add one per line; edit re-generates; pause to mute a flaky one.
+- **Every generated flow is checked in a real browser** right after it's saved (in the
+  background — the scenario shows *checking in a browser…*, then **verified** or
+  **first run failed** with the error). If the first run throws — or runs clean but
+  the page it ends on shows it never reached the goal — the model rewrites the flow
+  from what was actually on the page and the fixed version replaces it. The check signs
+  in like a hosted run and fills `{{VARIABLES}}`, so it really does act on your app
+  once — use a test account, as for hosted runs. Python and JS projects; operator
+  switch `SPECREEL_CLOUD_VERIFY_FLOWS=0`.
 - **Discover scenarios** re-runs the onboarding crawl against the project's target
   URL (signed in, if the project has stored sign-in) and offers only the flows your
   scenarios don't already cover — so coverage can grow as the app does, not just at
@@ -167,11 +175,14 @@ Onboarding from a URL seeds these scenarios for you; from there you refine in En
 ## Plans, team & billing
 
 - **Plans** — `Free` (1 project, manual publish), `Team` ($39/mo, unlimited
-  projects + scheduled monitoring + review), `Scale` ($149/mo + metered hosted
-  runs), `Enterprise` (custom). The Free **project limit is enforced**; publishing a
+  projects + scheduled monitoring + review), `Scale` ($149/mo, hosted runs
+  included), `Enterprise` (custom). The Free **project limit is enforced**; publishing a
   second project returns `402` until you upgrade. (Pricing rationale lives in the
-  pricing page.) Upgrades run through Stripe Checkout; "Manage billing"
-  opens the Stripe portal for cards, invoices, and cancellation.
+  pricing page.) Upgrades run through Stripe Checkout, which collects the
+  billing address and an optional tax ID for invoices. "Invoices & billing" opens the
+  Stripe portal for invoices and receipts, the card on file, and cancellation; a
+  paying workspace that switches between Team and Scale confirms it there too (never
+  a second subscription).
 - **Team seats** — invite teammates from **Team** (owner/admin only). Members view
   private galleries, comment, and approve. **Reviewers via review links never need a
   seat** — that's the point of feature B. A user can belong to multiple workspaces
@@ -189,6 +200,47 @@ the CLI.
 - **Review links** — create a tokenized `/(r)/<token>` URL from the project page.
   Anyone with the link can view the gallery, comment, and approve **without an
   account** — even if the project is private. Revoke a link any time.
+
+## Custom domains
+
+Serve your public demos on your own hostname instead of `/g/<workspace>/…`:
+
+- **Workspace subdomain** (Team+): `<workspace>.specreel.dev` works as soon as
+  you're on the plan — nothing to configure.
+- **Bring your own domain** (Scale+): Settings → *Custom domain*, enter
+  `demos.acme.com`, then add the DNS record it shows you (a CNAME at your DNS
+  host). The TLS certificate issues automatically once the record resolves —
+  hit **Re-check** to watch it go active.
+
+On your domain, projects live at `https://demos.acme.com/<project>/` (one public
+project? the root redirects straight to it; several? the root lists them).
+Vanity hosts serve **public content only** — private projects, the dashboard,
+and login stay on the main app URL. Downgrading a plan pauses the domain;
+visitors are redirected to the canonical `/g/…` URL, so links never die.
+
+### Operator setup (hosted or self-host, one-time)
+
+The app resolves vanity hosts from `X-Forwarded-Host`; any proxy that owns DNS
+and TLS can sit in front. The reference setup is Cloudflare (any plan — SaaS
+custom hostnames include 100 free, then ~$0.10/hostname/mo):
+
+1. **DNS** on the zone: keep the app host (e.g. `app.specreel.dev`) DNS-only →
+   Cloud Run; add a proxied wildcard `*.specreel.dev` (`AAAA 100::` placeholder
+   is fine — the Worker answers) and a proxied `edge.specreel.dev` the same way.
+2. **SSL/TLS → Custom Hostnames**: enable Cloudflare for SaaS, set the
+   **fallback origin** to `edge.specreel.dev`.
+3. **Worker**: `cd cloud/edge && npx wrangler deploy`, set `ORIGIN_URL` to the
+   Cloud Run service URL in `wrangler.jsonc`, and
+   `npx wrangler secret put EDGE_TOKEN`.
+4. **App env** (`cloud/env.deploy.yaml`): `SPECREEL_CLOUD_DOMAIN_SUFFIX`,
+   `SPECREEL_CLOUD_DOMAIN_CNAME`, `SPECREEL_CLOUD_EDGE_TOKEN` (same value as
+   the Worker secret), and — for automatic BYO provisioning —
+   `SPECREEL_CLOUD_CF_TOKEN` (Zone → SSL and Certificates → Edit) +
+   `SPECREEL_CLOUD_CF_ZONE`.
+
+Without the Cloudflare token the feature runs in **manual mode**: the app stores
+and serves the domain immediately, and your own proxy is responsible for
+pointing it at the app with the edge headers.
 
 ## Run your own
 Specreel Cloud runs from the repo (it's intentionally not shipped in the public

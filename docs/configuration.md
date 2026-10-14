@@ -10,7 +10,7 @@ product_name: Acme               # AI narration says this instead of localhost U
 quality: high              # motion: high | medium | low (file size tradeoff)
 theme: dark                         # dark | light
 ai: false                           # true (+ ANTHROPIC_API_KEY) to narrate captions
-ai_model: claude-opus-4-8           # model for narration (haiku-4-5 is cheaper)
+ai_model: claude-opus-5-5           # model for narration (haiku-5-5 is cheaper)
 bundle: false                       # true to also emit the single-file gallery.html
 
 showcase: false                     # true to also emit showcase/ — the curated,

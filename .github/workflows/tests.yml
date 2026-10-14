@@ -13,6 +13,7 @@ jobs:
           python-version: "3.12"
       - name: Install test deps
         # core engine is stdlib-only; Pillow covers the --mp4 tests.
+        # Playwright/MCP tests skip if absent.
         run: pip install pytest Pillow
       - name: Run the suite
         run: python -m pytest -q

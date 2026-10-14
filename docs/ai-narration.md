@@ -7,18 +7,18 @@ rewrites those captions into friendlier, sales-engineer-style lines.
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 specreel test-results/ -o site/ --ai
-specreel trace.zip -o out/ --ai --ai-model claude-haiku-4-5   # cheaper
+specreel trace.zip -o out/ --ai --ai-model claude-haiku-5-5   # cheaper
 ```
 Or enable it in [`specreel.yml`](configuration.md):
 ```yaml
 ai: true
-ai_model: claude-opus-4-8
+ai_model: claude-opus-5-5
 product_name: Acme     # narration says the product, not "localhost:3000"
 ```
 
 ## How it works
 - One batched, structured-output request per flow to the Anthropic Messages API
-  (`claude-opus-4-8` by default). Roughly **< $0.01 per flow**.
+  (`claude-opus-5-5` by default). Roughly **< $0.01 per flow**.
 - The **literal caption stays the source of truth** — it's shown as a gray
   sub-line beneath the narration, and it's what the freshness signature hashes.
 - **Graceful degrade:** no key, or any API error, and you simply get the literal
@@ -34,6 +34,6 @@ product_name: Acme     # narration says the product, not "localhost:3000"
 | Type "••••••••" into the "Create a password" field | **Set a secure password** |
 
 ## Cost & privacy
-- **BYO-key**, metered, never bundled. Use `claude-haiku-4-5` for the cheapest runs.
+- **BYO-key**, metered, never bundled. Use `claude-haiku-5-5` for the cheapest runs.
 - Only the step captions (+ optional `product_name`) are sent — not your
   screenshots or page content.

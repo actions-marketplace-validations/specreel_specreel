@@ -30,7 +30,7 @@ Specreel has one default command (render a trace or a directory) plus a few verb
 - `--theme dark|light` — color theme (default `dark`; or set `theme:` in config).
 - `--config PATH` — path to `specreel.yml` (auto-discovered in CWD / the traces dir otherwise).
 - `--ai` — opt-in [AI narration](ai-narration.md) (needs `ANTHROPIC_API_KEY`).
-- `--ai-model MODEL` — model for `--ai` (default `claude-opus-4-8`; `claude-haiku-4-5` is cheaper).
+- `--ai-model MODEL` — model for `--ai` (default `claude-opus-5-5`; `claude-sonnet-5-5` and `claude-haiku-5-5` are cheaper).
 - `--api-key KEY` — Anthropic key (else read from `ANTHROPIC_API_KEY`).
 - `--notify URL` — Slack incoming-webhook to post a build summary to (batch).
 - `--url URL` — public gallery URL to include in the notification/links.
@@ -86,7 +86,9 @@ script. See [recommend](recommend.md).
 - `--header "K: V"` — extra request header (repeatable), e.g. an `Authorization` bearer.
 - `--lang py|js` — scaffold language (auto-detected from `package.json` otherwise).
 - `-o FILE` — scaffold path (default `specreel_flows.<lang>`).
-- `--ai` / `--api-key` — curate & rename the suggestions with AI.
+- `--ai` / `--api-key` — re-rank and retitle the suggestions with AI (crawl titles read
+  like "Open Acme" for every page; curated ones say what the demo shows). Falls back to
+  crawl order on any failure; bounded to ~25s.
 - `--json` — emit suggestions + scaffold as JSON on stdout (progress/errors to stderr,
   no file written). Used by Specreel Cloud's onboarding wizard.
 
@@ -101,6 +103,34 @@ turned into runnable flows by AI (BYO-key), grounded in the other flows; without
 they're left as a `TODO` stub. Powers Specreel Cloud's onboarding wizard.
 - `--api-key KEY` (or `ANTHROPIC_API_KEY`) — needed for `nl_prompt` items.
 - `-o FILE` — output (default stdout).
+
+## `nlflow --desc "…" --url <base>` — one plain-English flow → runnable code
+Turn a description ("search the docs for 'trace viewer' and open the top result") into
+a Playwright flow body, grounded in crawled pages (`--context`, the `recommend --json`
+flows) so it only names controls that exist. AI, BYO-key. Prints the flow as JSON.
+Generated code navigates with `BASE` (the URL you gave, which may be a deep page) and
+`ORIGIN` (its scheme + host) — other pages are `ORIGIN + "/path"`.
+- `--lang py|js`, `--context FILE`, `--vars NAME,…` (referenced as `{{NAME}}`).
+- `--verify` — run the flow once in a headless browser before returning it. If it
+  throws, the model gets the error, the failing line and what was actually on the page
+  (button/link names, fields, visible text — including things the crawl couldn't see,
+  like an opened search modal) and rewrites it once. If it runs clean, a quick check of
+  the page it ended on asks whether it actually reached the goal (a flow that waits on
+  text that was already there "passes" without ever seeing the result) — a miss gets the
+  same one rewrite. The output says `"verified": true|false` (+ `verify_error`). The
+  code runs in a subprocess with a scrubbed environment (no API keys). Python flows need
+  `playwright`; JS flows need Node + `@playwright/test` (found via
+  `SPECREEL_NODE_MODULES`, `./node_modules` or `npm root -g`).
+- `--login-steps FILE` — sign-in statements to run before the flow when verifying.
+- `--var-values FILE` — JSON `{NAME: value}` filling `{{NAME}}` for the verify run only.
+- `--draft FILE` — verify/repair an existing flow (a previous `nlflow` result) instead
+  of generating a new one.
+
+```bash
+specreel recommend https://app.example.com --browser --json > crawl.json
+specreel nlflow --desc "log in and open billing" --url https://app.example.com \
+  --context <(jq .flows crawl.json) --verify
+```
 
 ## `curate --flows <json> --instruction "…"` — refine flows in plain English
 Reorder / rename / **drop** discovered flows by a plain-English instruction (e.g.
@@ -160,7 +190,7 @@ non-zero exit if no key. Recovered flows read as fixes, regressed as known issue
 added as new.
 - `--since <manifest.json>` — diff against a previous build.
 - `--product NAME` — product name for the notes.
-- `--ai-model MODEL` / `--api-key KEY` — model + key (default `claude-opus-4-8`).
+- `--ai-model MODEL` / `--api-key KEY` — model + key (default `claude-opus-5-5`).
 - `-o FILE` — write to a file instead of stdout.
 
 ```bash
@@ -168,7 +198,9 @@ specreel notes site --since prev/manifest.json --product "Acme" -o RELEASE.md
 ```
 
 ## Environment variables
-- `ANTHROPIC_API_KEY` — key for `--ai` (narration, recommend curation).
+- `ANTHROPIC_API_KEY` — key for `--ai` (narration, recommend curation) and `nlflow`.
 - `OPENAI_API_KEY` — key for `--voice` (studio neural voiceover).
 - `SPECREEL_SLACK_WEBHOOK` — default Slack webhook for `--notify`.
 - `BASE_URL` — read by scaffolded `recommend` scripts to override the app URL.
+- `SPECREEL_NODE_MODULES` — a `node_modules` dir with `@playwright/test`, for
+  `nlflow --verify` on JS flows.
