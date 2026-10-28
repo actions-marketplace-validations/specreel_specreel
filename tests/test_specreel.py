@@ -188,6 +188,7 @@ def test_plumbing_methods_skipped():
     assert "scrollIntoViewIfNeeded" in specreel.SKIP_METHODS
     assert "innerText" in specreel.SKIP_METHODS
     assert "evaluate" in specreel.SKIP_METHODS
+    assert "queryCount" in specreel.SKIP_METHODS
     assert "evaluateExpression" in specreel.SKIP_METHODS
     events = [
         {"type": "before", "callId": "1", "method": "click", "params": {}, "startTime": 1},
@@ -590,9 +591,13 @@ def test_recommend_flows_ranking_and_scaffold():
     assert any(f["type"] == "search" for f in flows)
     py = specreel.scaffold_script(flows, "http://app", lang="py")
     assert "async_playwright" in py and "tracing.start" in py
-    assert 'get_by_placeholder("Enter your email")' in py and "demo@example.com" in py
+    assert 'get_by_placeholder("Enter your email").first' in py and "demo@example.com" in py
     js = specreel.scaffold_script(flows, "http://app", lang="js")
     assert "@playwright/test" in js and "getByPlaceholder" in js
+    # every field locator is strict-mode safe: a page with the same placeholder in
+    # two forms (hero + footer) used to fail the very first hosted run
+    assert '("Enter your email").fill' not in py
+    assert 'getByPlaceholder("Enter your email").first().fill' in js
 
 
 def test_scaffold_quality_contract():
@@ -667,7 +672,7 @@ def test_ai_curate_instruction_drops(monkeypatch):
     flows = [{"type": "form", "title": "A", "url": "/a", "heading": ""},
              {"type": "nav", "title": "B", "url": "/b", "heading": ""},
              {"type": "nav", "title": "C", "url": "/c", "heading": ""}]
-    monkeypatch.setattr(specreel, "_anthropic_messages", lambda b, k: {
+    monkeypatch.setattr(specreel, "_anthropic_messages", lambda b, k, timeout=60: {
         "content": [{"type": "text", "text": _json.dumps({"order": [{"index": 0, "title": "Sign up"}]})}]})
     out = specreel.ai_curate(flows, "key", instruction="only keep the form", allow_drop=True)
     assert [f["title"] for f in out] == ["Sign up"]       # B and C dropped per instruction
@@ -1489,7 +1494,7 @@ def test_strip_embedded_login_and_ensure_first():
         'await page.get_by_role("button", name="Add all").nth(0).click()\n'
     )
     out = specreel.normalize_flow_code(nested, "py")
-    assert out.startswith('await page.goto(BASE + "/simulations")')
+    assert out.startswith('await page.goto(ORIGIN + "/simulations")')
     assert "/login" not in out
     bare = 'await page.get_by_role("button", name="Pick an Audience").click()'
     assert ".first.click()" in specreel.ensure_locator_first(bare)
@@ -1531,7 +1536,7 @@ def test_nl_flow_prompt_forbids_invented_and_fragile_locators():
 
 
 def test_context_from_recommend_and_merge():
-    from cloud import onboard
+    onboard = pytest.importorskip("cloud.onboard")     # cloud/ isn't in the OSS export
     raw = {"flows": [
         {"title": "Audiences", "url": "https://app.test/audiences/overview",
          "type": "nav", "labels": ["Pin Audiences"], "fields": []},
@@ -1783,3 +1788,281 @@ def test_goto_settled_tolerates_self_navigation():
         assert False, "should have raised"
     except RuntimeError as e:
         assert "ERR_NAME_NOT_RESOLVED" in str(e) and b.gotos == 2
+
+
+# --------------------------------------------------------------------------- #
+# Model settings + generated-flow robustness (picked by a flow eval)
+# --------------------------------------------------------------------------- #
+
+def test_tune_sizes_thinking_models_and_leaves_older_ones_alone():
+    """5.x models always think and it counts toward max_tokens — an 800 cap cut
+    1 in 7 nl_flow drafts off mid-JSON in the eval. Older models keep their
+    original request (claude-haiku-4-5 rejects `effort`)."""
+    b = specreel._tune({"model": "claude-opus-5-5", "max_tokens": 800,
+                        "output_config": {"format": {"type": "json_schema"}}}, "medium")
+    assert b["max_tokens"] >= 16000
+    assert b["output_config"] == {"format": {"type": "json_schema"}, "effort": "medium"}
+    assert b["fallbacks"] == "default"
+    for old in ("claude-haiku-4-5", "claude-opus-4-8"):
+        assert specreel._tune({"model": old, "max_tokens": 800}, "low") == {"model": old, "max_tokens": 800}
+    assert "fallbacks" not in specreel._tune({"model": "claude-haiku-5-5"}, "low")
+    assert specreel.DEFAULT_AI_MODEL == "claude-opus-5-5"
+
+
+def test_fallback_requests_send_the_matching_beta_header(monkeypatch):
+    import urllib.request
+    seen = {}
+
+    class R:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"content": []}'
+
+    def fake_urlopen(req, timeout=None):
+        seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return R()
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    specreel._anthropic_messages({"model": "claude-opus-5-5", "fallbacks": "default"}, "k")
+    assert seen["headers"]["anthropic-beta"] == "server-side-fallback-2026-07-01"
+    specreel._anthropic_messages({"model": "claude-haiku-4-5"}, "k")
+    assert "anthropic-beta" not in seen["headers"]
+
+
+def test_base_plus_path_becomes_origin_plus_path():
+    """Users paste deep pages; BASE + "/path" then 404s (…/web-form.html/selenium/…)."""
+    code = ('await page.goto(BASE)\n'
+            'await page.goto(BASE + "/docs")\n'
+            "await page.goto(BASE + '/y')")
+    out = specreel.normalize_flow_code(code, "py")
+    assert out.splitlines() == ['await page.goto(BASE)', 'await page.goto(ORIGIN + "/docs")',
+                                "await page.goto(ORIGIN + '/y')"]
+    assert "${ORIGIN}/x" in specreel.normalize_flow_code("await page.goto(`${BASE}/x`);", "js")
+    assert specreel.url_origin("https://www.selenium.dev/selenium/web/web-form.html") == "https://www.selenium.dev"
+    assert specreel.url_origin("http://localhost:5000/") == "http://localhost:5000"
+
+
+def test_scaffold_defines_origin_from_base_at_run_time():
+    flow = {"title": "Docs", "type": "custom", "url": "https://x.dev/app/page.html",
+            "heading": "", "fields": [], "code": 'await page.goto(ORIGIN + "/docs")'}
+    py = specreel.scaffold_script([dict(flow)], "https://x.dev/app/page.html", lang="py")
+    compile(py, "<scaffold>", "exec")
+    header = py.split("FLOWS = []")[0].split('"""', 2)[2]
+    ns = {}
+    # imports + BASE + ORIGIN, minus Playwright (not needed to compute ORIGIN)
+    exec("\n".join(ln for ln in header.splitlines() if "playwright" not in ln), ns)
+    assert ns["BASE"] == "https://x.dev/app/page.html" and ns["ORIGIN"] == "https://x.dev"
+    js = specreel.scaffold_script([dict(flow)], "https://x.dev/app/page.html", lang="js")
+    assert "const ORIGIN = new URL(BASE).origin;" in js
+
+
+def test_page_parser_drops_aria_hidden_decoration_from_control_names():
+    """quotes.toscrape's pager is "Next <span aria-hidden>→</span>": the crawl said
+    "Next →", every model used it verbatim, and the locator never matched."""
+    p = specreel._PageParser()
+    p.feed('<li class="next"><a href="/page/2/">Next <span aria-hidden="true">&rarr;</span></a></li>'
+           # an unclosed <p>/<li> inside a hidden region must not hide the rest of the page
+           '<div aria-hidden="true"><p>decor<li>x</div>'
+           '<a href="/blog">Blog</a><button>Save <i aria-hidden="true">✓</i></button>'
+           '<a href="/x" aria-label="Close"><span aria-hidden="true">×</span></a>')
+    assert [l["text"] for l in p.links] == ["Next", "Blog", "Close"]
+    assert p.buttons == ["Save"]
+
+
+def test_ensure_locator_first_does_not_double_python_first():
+    out = specreel.ensure_locator_first('await page.get_by_role("link", name="love").first.click()')
+    assert ".first.first" not in out
+
+
+def test_verify_flow_runs_in_a_scrubbed_subprocess_and_reports_the_failure(tmp_path, monkeypatch):
+    """A generated flow runs once before it's saved. On failure: which line, the
+    error, and what was really on the page (accessible names, not "Next →")."""
+    pytest.importorskip("playwright")
+    import functools
+    import http.server
+    import socketserver
+    import threading
+    (tmp_path / "index.html").write_text(
+        '<!doctype html><title>Quotes</title><h1>Quotes</h1>'
+        '<a href="/page2.html">Next <span aria-hidden="true">&rarr;</span></a>')
+    (tmp_path / "page2.html").write_text('<!doctype html><title>Page 2</title><h1>Two</h1>')
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}/index.html"
+    try:
+        good = specreel.verify_flow(
+            'await page.goto(BASE)\n'
+            'await page.get_by_role("link", name="Next").first.click()\n'
+            'await expect(page).to_have_title("Page 2")', base)
+        assert good["ok"] is True
+
+        bad = specreel.verify_flow(
+            'await page.goto(BASE)\n'
+            '# the crawl used to say "Next →"\n'
+            'await page.get_by_role("link", name="Next →").first.click(timeout=1500)', base)
+        assert bad["ok"] is False and bad["line"] == 2 and "Next →" in bad["code_line"]
+        assert "Timeout" in bad["error"] and "Next" in bad["page"]["links"]
+        assert "Quotes" in bad["page"]["text"]          # what a judge / repair can read
+
+        # the code is model-written from user text: no operator secrets in its env
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
+        env = specreel.verify_flow(
+            'assert "ANTHROPIC_API_KEY" not in os.environ, "leaked"', base)
+        assert env["ok"] is True
+
+        # a broken sign-in prelude is flagged as such, not blamed on the flow
+        login = specreel.verify_flow(
+            "await page.goto(BASE)", base,
+            login_steps='await page.get_by_role("button", name="Sign in").click(timeout=500)')
+        assert login["ok"] is False and login["in_login"] is True
+    finally:
+        httpd.shutdown()
+
+
+def test_nl_flow_verify_repairs_from_what_was_on_the_page(monkeypatch):
+    drafts = iter([
+        {"title": "Next page", "code": 'await page.goto(BASE)\n'
+                                       'await page.get_by_role("link", name="Next →").first.click()'},
+        {"title": "Next page", "code": 'await page.goto(BASE)\n'
+                                       'await page.get_by_role("link", name="Next").first.click()'},
+    ])
+    sent = []
+
+    def fake_api(body, key, timeout=60):
+        sent.append(json.loads(body["messages"][0]["content"]))
+        return {"content": [{"type": "text", "text": json.dumps(next(drafts))}]}
+
+    def fake_verify(code, base, lang="py", login_steps="", variables=None, **kw):
+        if "Next →" in code:
+            return {"ok": False, "error": "TimeoutError: Locator.click", "line": 1,
+                    "code_line": code.splitlines()[1], "in_login": False, "url": base,
+                    "page": {"links": ["Next"], "buttons": [], "fields": []}}
+        return {"ok": True, "error": "", "line": None, "code_line": "", "in_login": False,
+                "url": base, "page": {}}
+
+    monkeypatch.setattr(specreel, "_anthropic_messages", fake_api)
+    monkeypatch.setattr(specreel, "verify_flow", fake_verify)
+    monkeypatch.setattr(specreel, "check_goal", lambda *a, **k: {"achieved": True, "reason": ""})
+    fl = specreel.nl_flow("go to the next page", [], "https://q.test/", "py", "k", verify=True)
+    assert fl["verified"] is True and 'name="Next")' in fl["code"]
+    assert sent[1]["page_at_failure"]["links"] == ["Next"]
+    assert sent[1]["failed_line"].endswith('name="Next →").first.click()')
+    # without verify: no browser run, no verified flag
+    drafts = iter([{"title": "x", "code": "await page.goto(BASE)"}])
+    assert "verified" not in specreel.nl_flow("x", [], "https://q.test/", "py", "k")
+
+
+def test_nl_flow_goal_check_repairs_a_flow_that_ran_clean_but_missed(monkeypatch):
+    """Waiting on text that was already on the page 'passes' instantly and never
+    sees the result. The end-state check calls that a miss and asks for a fix."""
+    drafts = iter([
+        {"title": "t", "code": "await page.get_by_text('client side').first.wait_for()"},
+        {"title": "t", "code": "await page.locator('.bg-success').first.wait_for(timeout=30000)"},
+    ])
+    sent = []
+
+    def fake_api(body, key, timeout=60):
+        sent.append(json.loads(body["messages"][0]["content"]))
+        return {"content": [{"type": "text", "text": json.dumps(next(drafts))}]}
+
+    ok = {"ok": True, "error": "", "line": None, "code_line": "", "in_login": False,
+          "url": "u", "page": {"text": "Client Side Delay ..."}}
+    monkeypatch.setattr(specreel, "_anthropic_messages", fake_api)
+    monkeypatch.setattr(specreel, "verify_flow", lambda *a, **k: dict(ok))
+    monkeypatch.setattr(specreel, "check_goal", lambda desc, code, page, key, **k: (
+        {"achieved": True, "reason": ""} if "bg-success" in code else
+        {"achieved": False, "reason": "the result label never appeared"}))
+    fl = specreel.nl_flow("click and wait for the result", [], "https://u.test/", "py", "k",
+                          verify=True)
+    assert fl["verified"] is True and "bg-success" in fl["code"]
+    assert sent[1]["run_error"] == "Ran to the end, but the result label never appeared"
+    assert sent[1]["fix_instruction"] == specreel.GOAL_REPAIR_INSTRUCTION
+
+    # still missing after the fix: keep it, but don't call it verified
+    drafts = iter([{"title": "t", "code": "await page.goto(BASE)"},
+                   {"title": "t", "code": "await page.goto(BASE + '/x')"}])
+    monkeypatch.setattr(specreel, "check_goal",
+                        lambda *a, **k: {"achieved": False, "reason": "nothing happened"})
+    fl = specreel.nl_flow("x", [], "https://u.test/", "py", "k", verify=True)
+    assert fl["verified"] is False and fl["verify_error"].startswith("Ran to the end, but")
+
+    # the judge itself failing is "can't tell", never a miss
+    drafts = iter([{"title": "t", "code": "await page.goto(BASE)"}])
+    monkeypatch.setattr(specreel, "check_goal", lambda *a, **k: None)
+    assert specreel.nl_flow("x", [], "https://u.test/", "py", "k", verify=True)["verified"] is True
+
+
+def test_verify_flow_runs_javascript_flows(tmp_path):
+    """JS projects are verified with Node + @playwright/test (linked into the run
+    dir: ESM ignores NODE_PATH). Skipped where they aren't installed."""
+    import shutil as _sh
+    if not (_sh.which("node") and specreel.node_modules_with_playwright()):
+        pytest.skip("node + @playwright/test not available")
+    import functools
+    import http.server
+    import socketserver
+    import threading
+    (tmp_path / "index.html").write_text(
+        '<!doctype html><title>Q</title><a href="/two.html">Next <span aria-hidden="true">&rarr;</span></a>')
+    (tmp_path / "two.html").write_text('<!doctype html><title>Two</title><h1>Two</h1>')
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path))
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}/index.html"
+    try:
+        good = specreel.verify_flow(
+            "await page.goto(BASE);\n"
+            "await page.getByRole('link', { name: 'Next' }).first().click();\n"
+            "await expect(page).toHaveTitle('Two');", base, lang="js")
+        assert good["ok"] is True and "Two" in good["page"]["text"]
+        bad = specreel.verify_flow(
+            "await page.goto(BASE);\n"
+            "await page.getByRole('link', { name: 'Next →' }).first().click({ timeout: 1500 });",
+            base, lang="js")
+        assert bad["ok"] is False and bad["line"] == 1 and "Next" in bad["page"]["links"]
+    finally:
+        httpd.shutdown()
+
+
+def test_playwright_164_frames_are_read_from_their_own_files(tmp_path):
+    """Playwright 1.64 dropped resources/<sha1> for screencast frames: each event
+    names its own file. Reading only the old key rendered every hosted run as
+    "unreadable trace (KeyError: 'sha1')" — 0 demos. Frame paths are untrusted:
+    one pointing outside the trace must not be embedded."""
+    import base64 as _b64
+    jpeg = (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9")
+    def trace(frame_file, extra=None):
+        events = [
+            {"type": "context-options", "options": {"viewport": {"width": 1280, "height": 720}}},
+            {"type": "before", "callId": "c1", "startTime": 1, "class": "Frame",
+             "method": "goto", "params": {"url": "https://x.test/"}},
+            {"type": "after", "callId": "c1", "endTime": 50},
+            {"type": "screencast-frame", "pageId": "page@1", "file": frame_file,
+             "width": 1280, "height": 720, "timestamp": 60},
+        ]
+        zp = tmp_path / f"t{len(list(tmp_path.iterdir()))}.zip"
+        with zipfile.ZipFile(zp, "w") as z:
+            z.writestr("trace.trace", "\n".join(json.dumps(e) for e in events))
+            z.writestr("screencast/page@1-60.jpeg", jpeg)
+        return zp
+    marker = _b64.b64encode(jpeg).decode()[:16]
+    out = tmp_path / "ok"
+    stats = specreel.generate_demo(str(trace("screencast/page@1-60.jpeg")), str(out), verbose=False)
+    assert stats and marker in (out / "demo.html").read_text()
+
+    # a frame path escaping the trace dir is refused, not read: put a real image
+    # one level ABOVE an unpacked trace and point a frame at it
+    d = tmp_path / "unpacked"
+    d.mkdir()
+    (tmp_path / "outside.jpeg").write_bytes(jpeg)
+    (d / "trace.trace").write_text("\n".join(json.dumps(e) for e in [
+        {"type": "before", "callId": "c1", "startTime": 1, "class": "Frame",
+         "method": "goto", "params": {"url": "https://x.test/"}},
+        {"type": "after", "callId": "c1", "endTime": 50},
+        {"type": "screencast-frame", "file": "../outside.jpeg", "timestamp": 60}]))
+    steps, frames = specreel.build_steps(specreel.load_events(str(d)))
+    for s in steps:
+        s["frame"], s["clip"] = "../outside.jpeg", ["../outside.jpeg"]
+    assert (d / "../outside.jpeg").exists()                       # it IS readable…
+    assert all(not r["img"] for r in specreel.render_steps(steps, str(d)))   # …but refused
